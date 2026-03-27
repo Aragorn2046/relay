@@ -1,0 +1,19 @@
+[Unit]
+Description=Relay TCP Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit User and paths for your system
+User=YOUR_USERNAME
+ExecStart=/usr/bin/python3 /home/YOUR_USERNAME/projects/relay/relay.py daemon
+Restart=always
+RestartSec=10
+EnvironmentFile=-/home/YOUR_USERNAME/.relay-env
+
+StandardOutput=append:/home/YOUR_USERNAME/logs/relay-daemon.log
+StandardError=append:/home/YOUR_USERNAME/logs/relay-daemon.err
+
+[Install]
+WantedBy=multi-user.target

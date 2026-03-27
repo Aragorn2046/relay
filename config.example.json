@@ -1,0 +1,31 @@
+{
+  "machine": "my-machine",
+  "port": 7272,
+  "peers": {
+    "machine-a": {"ip": "100.x.x.x", "ssh_user": "username"},
+    "machine-b": {"ip": "100.x.x.x", "ssh_user": "username"}
+  },
+  "machine_map": {
+    "HOSTNAME_PATTERN": "machine-a"
+  },
+  "remote_relay_paths": {
+    "machine-a": "/home/username/relay-data",
+    "machine-b": "/home/username/relay-data"
+  },
+  "file_fallback": {
+    "vault_path": "/path/to/relay-data",
+    "smb_path": null
+  },
+  "secret_file": "~/.relay-secret",
+  "log_dir": "~/logs",
+  "socket_path": "/tmp/relay.sock",
+  "auto_execute": {
+    "enabled": true,
+    "max_concurrent": 2,
+    "timeout": 300,
+    "default_model": "sonnet",
+    "default_budget": 1.0,
+    "max_budget": 5.0,
+    "allowed_models": ["sonnet", "opus", "haiku"]
+  }
+}
