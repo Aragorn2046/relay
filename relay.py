@@ -24,6 +24,7 @@ import hmac
 import json
 import logging
 import os
+import shutil
 import signal
 import socket
 import struct
@@ -431,13 +432,31 @@ class AutoExecutor:
         success = False
         result = ""
 
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        # Daemons spawned outside an interactive shell don't inherit fnm/Homebrew
+        # PATH entries, so `claude` isn't resolvable. Prepend the common install
+        # locations so subprocess can find the binary on both WSL and macOS.
+        home = Path.home()
+        extra_path = ":".join(str(p) for p in [
+            home / ".local/share/fnm/aliases/default/bin",
+            home / ".local/bin",
+            home / ".bun/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+        ])
+        env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
+        claude_bin = shutil.which("claude", path=env["PATH"])
+
         try:
-            cmd = ["claude", "--model", model, "--max-budget-usd", str(budget), "-p", task]
-            env = os.environ.copy()
-            env.pop("CLAUDECODE", None)
-            cwd = str(Path.home() / "workspace")
+            if not claude_bin:
+                raise FileNotFoundError(
+                    f"'claude' binary not on PATH. Looked in: {extra_path}"
+                )
+            cmd = [claude_bin, "--model", model, "--max-budget-usd", str(budget), "-p", task]
+            cwd = str(home / "workspace")
             if not Path(cwd).exists():
-                cwd = str(Path.home())
+                cwd = str(home)
 
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
@@ -450,8 +469,11 @@ class AutoExecutor:
                 result += f"\nSTDERR: {proc.stderr or '(none)'}"
         except subprocess.TimeoutExpired:
             result = f"TIMEOUT after {self.config.exec_timeout}s"
+        except FileNotFoundError as e:
+            result = f"CLAUDE BINARY NOT FOUND: {e}"
+            self.logger.error(f"AUTO-EXEC PATH failure: {e}")
         except Exception as e:
-            result = f"ERROR: {e}"
+            result = f"ERROR: {type(e).__name__}: {e}"
 
         duration = time.time() - start
         status = "SUCCESS" if success else "FAILED"
