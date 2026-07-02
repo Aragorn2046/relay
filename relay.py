@@ -73,18 +73,20 @@ def detect_platform():
 
 def detect_tailscale_ip():
     """Get this machine's Tailscale IPv4 address."""
-    # Try tailscale CLI first (works on macOS and WSL2 with mirrored networking)
-    try:
-        result = subprocess.run(
-            ["tailscale", "ip", "-4"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            ip = result.stdout.strip()
-            if ip.startswith("100."):
-                return ip
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    # WSL2: no Linux tailscale binary, but tailscale.exe via /mnt/c works
+    candidates = ["tailscale", "tailscale.exe"]
+    for cmd in candidates:
+        try:
+            result = subprocess.run(
+                [cmd, "ip", "-4"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                ip = result.stdout.strip().splitlines()[0].strip() if result.stdout else ""
+                if ip.startswith("100."):
+                    return ip
+        except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
+            continue
 
     # Fallback: parse ip addr for 100.x.x.x (WSL2 mirrored networking)
     try:
@@ -95,12 +97,11 @@ def detect_tailscale_ip():
             for line in result.stdout.splitlines():
                 line = line.strip()
                 if "inet 100." in line:
-                    # Extract IP from "inet 100.x.x.x/32"
                     parts = line.split()
                     for p in parts:
                         if p.startswith("100."):
                             return p.split("/")[0]
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
         pass
 
     # Last resort: use config
