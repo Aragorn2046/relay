@@ -55,7 +55,6 @@ class ModelNormalizationTests(unittest.TestCase):
             "claude-3-opus-20240229",
             "CLAUDE_OPUS_5",
             " opus\n",
-            "opus-x",
         )
         for alias in aliases:
             with self.subTest(alias=alias):
@@ -67,6 +66,7 @@ class ModelNormalizationTests(unittest.TestCase):
             "claude",
             "anthropic:anthropic:claude-opus-5",
             "vendor-opus-x",
+            "opus-x",
             "claude-sonnet-opus",
             "",
             None,
@@ -74,6 +74,16 @@ class ModelNormalizationTests(unittest.TestCase):
             True,
             ["opus"],
             {"model": "opus"},
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(relay.normalize_model(value))
+
+    def test_unknown_future_model_versions_are_rejected(self):
+        for value in (
+            "claude-opus-6",
+            "anthropic:claude-fable-9",
+            "claude-sonnet-999",
+            "fable-5-2",
         ):
             with self.subTest(value=value):
                 self.assertIsNone(relay.normalize_model(value))

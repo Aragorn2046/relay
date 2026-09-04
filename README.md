@@ -63,8 +63,9 @@ Relay auto-execution accepts exactly two canonical models:
 Legacy names are accepted at the receiver and audited when normalized. Fable,
 Sonnet, and Haiku aliases map to Fable 5.1; old Opus aliases map to Opus 5.
 This includes dated vendor IDs such as `claude-3-5-sonnet-20240620` and
-`claude-3-opus-20240229`. Unknown families are rejected and, when `reply_to` is
-present, the sender receives a failure result.
+`claude-3-opus-20240229`. Compatibility uses a finite alias table: unknown
+families and unlisted or future version IDs are rejected and, when `reply_to`
+is present, the sender receives a failure result.
 
 During the compatibility window the CLI validates and normalizes every accepted
 model spelling locally, then emits only the compatible `sonnet` or `opus` wire

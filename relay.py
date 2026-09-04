@@ -65,6 +65,27 @@ CLAUDE_OPTIONAL_FLAGS = ("--fallback-model",)
 ULTRACODE_EFFORT = "ultracode"
 ULTRACODE_SETTINGS = '{"ultracode":true}'
 
+# Compatibility is deliberately finite.  Accept only model spellings that
+# were actually used by the previous relay policy or are documented legacy
+# Anthropic IDs; family-shaped future IDs must fail visibly instead of being
+# silently redirected to a different model.
+MODEL_ALIASES = {
+    PRIMARY_MODEL: PRIMARY_MODEL,
+    "fable": PRIMARY_MODEL,
+    "claude-fable-5": PRIMARY_MODEL,
+    "sonnet": PRIMARY_MODEL,
+    "claude-sonnet-5": PRIMARY_MODEL,
+    "haiku": PRIMARY_MODEL,
+    "claude-haiku-4-5-20251001": PRIMARY_MODEL,
+    "claude-3-5-sonnet-20240620": PRIMARY_MODEL,
+    "claude-3-7-sonnet-latest": PRIMARY_MODEL,
+    FALLBACK_MODEL: FALLBACK_MODEL,
+    "opus": FALLBACK_MODEL,
+    "claude-opus-4": FALLBACK_MODEL,
+    "claude-opus-4-1": FALLBACK_MODEL,
+    "claude-3-opus-20240229": FALLBACK_MODEL,
+}
+
 
 def normalize_model(model):
     """Return the canonical relay model for a supported current or legacy name."""
@@ -77,29 +98,7 @@ def normalize_model(model):
             normalized = normalized.removeprefix(provider_prefix)
             break
 
-    if normalized in ALLOWED_MODELS:
-        return normalized
-
-    parts = normalized.split("-")
-    claude_qualified = bool(parts and parts[0] == "claude")
-    if claude_qualified:
-        parts = parts[1:]
-
-    families = {part for part in parts if part in {"fable", "sonnet", "haiku", "opus"}}
-    if len(families) != 1:
-        return None
-    family = next(iter(families))
-
-    # Bare aliases must start with the family. Vendor IDs may put a dated
-    # generation before it, for example claude-3-5-sonnet-20240620.
-    if not claude_qualified and (not parts or parts[0] != family):
-        return None
-
-    if family in {"fable", "sonnet", "haiku"}:
-        return PRIMARY_MODEL
-    if family == "opus":
-        return FALLBACK_MODEL
-    return None
+    return MODEL_ALIASES.get(normalized)
 
 
 def build_claude_environment():
