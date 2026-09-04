@@ -116,23 +116,64 @@ class ConfigModelInvariantTests(unittest.TestCase):
 
         self.assertEqual(config.allowed_models, [relay.FALLBACK_MODEL])
         self.assertEqual(config.default_model, relay.FALLBACK_MODEL)
-        self.assertEqual(config.wire_default_model, relay.FALLBACK_MODEL)
+        self.assertEqual(config.wire_default_model, "opus")
+        self.assertTrue(config.auto_execute_enabled)
         self.assertTrue(any("outside allowed_models" in event for _, event in config.model_policy_events))
 
     def test_absent_allowlist_uses_the_canonical_pair(self):
         config = self._load_config({"default_model": "sonnet"})
 
         self.assertEqual(config.allowed_models, list(relay.ALLOWED_MODELS))
+        self.assertTrue(config.auto_execute_enabled)
 
-    def test_wholly_invalid_allowlist_uses_the_canonical_pair_with_warning(self):
+    def test_canonical_default_uses_legacy_wire_alias_until_receivers_are_ready(self):
+        config = self._load_config({
+            "default_model": relay.PRIMARY_MODEL,
+            "allowed_models": list(relay.ALLOWED_MODELS),
+        })
+
+        self.assertEqual(config.default_model, relay.PRIMARY_MODEL)
+        self.assertEqual(config.wire_default_model, "sonnet")
+        self.assertFalse(config.canonical_wire_ready)
+
+    def test_canonical_default_emits_only_after_receiver_readiness_gate(self):
+        config = self._load_config({
+            "canonical_wire_ready": True,
+            "default_model": relay.PRIMARY_MODEL,
+            "allowed_models": list(relay.ALLOWED_MODELS),
+        })
+
+        self.assertEqual(config.wire_default_model, relay.PRIMARY_MODEL)
+        self.assertTrue(config.canonical_wire_ready)
+
+    def test_explicit_empty_allowlist_disables_auto_execution(self):
+        config = self._load_config({
+            "default_model": "sonnet",
+            "allowed_models": [],
+        })
+
+        self.assertEqual(config.allowed_models, [])
+        self.assertFalse(config.auto_execute_enabled)
+
+    def test_explicit_null_allowlist_disables_auto_execution(self):
+        config = self._load_config({
+            "default_model": "sonnet",
+            "allowed_models": None,
+        })
+
+        self.assertEqual(config.allowed_models, [])
+        self.assertFalse(config.auto_execute_enabled)
+
+    def test_wholly_invalid_allowlist_disables_auto_execution_with_warning(self):
         config = self._load_config({
             "default_model": "sonnet",
             "allowed_models": ["gpt-5.6", None],
         })
 
-        self.assertEqual(config.allowed_models, list(relay.ALLOWED_MODELS))
+        self.assertEqual(config.allowed_models, [])
+        self.assertFalse(config.auto_execute_enabled)
         self.assertTrue(any(
-            "no supported entries" in event
+            "auto-execution is disabled" in event
             for level, event in config.model_policy_events
             if level == "warning"
         ))
@@ -240,6 +281,30 @@ class ClaudeCapabilityProbeTests(unittest.TestCase):
 
         self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], relay.FALLBACK_MODEL)
 
+    def test_failed_capability_result_is_retried_then_success_is_cached(self):
+        executor = relay.AutoExecutor(SimpleNamespace(), mock.Mock())
+        failure = full_capability_report()
+        failure.update({
+            "ok": False,
+            "parser_smoke_ok": False,
+            "error": "transient parser failure",
+        })
+        success = full_capability_report()
+
+        with mock.patch.object(
+            relay,
+            "probe_claude_capabilities",
+            side_effect=[failure, success],
+        ) as probe:
+            first = executor._get_claude_capabilities("/test/claude", {"PATH": "/test"})
+            second = executor._get_claude_capabilities("/test/claude", {"PATH": "/test"})
+            third = executor._get_claude_capabilities("/test/claude", {"PATH": "/test"})
+
+        self.assertFalse(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertIs(third, second)
+        self.assertEqual(probe.call_count, 2)
+
 
 class ModelPolicyAuditTests(unittest.TestCase):
     def test_daemon_emits_deferred_config_normalization_events(self):
@@ -255,6 +320,34 @@ class ModelPolicyAuditTests(unittest.TestCase):
         logger.warning.assert_called_once_with(
             "MODEL POLICY: %s",
             "dropped unsupported model",
+        )
+
+
+class DisabledAutoExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_receiver_refuses_without_starting_worker(self):
+        logger = mock.Mock()
+        config = SimpleNamespace(
+            log_dir=Path("/tmp"),
+            model_policy_events=[],
+            auto_execute_enabled=False,
+        )
+        with mock.patch.object(relay.RelayDaemon, "_setup_logging", return_value=logger):
+            daemon = relay.RelayDaemon(config)
+        daemon.executor = mock.Mock()
+
+        message = {
+            "from": "dawn",
+            "body": "test task",
+            "auto_execute": True,
+            "reply_to": "dawn",
+        }
+        await daemon._process_message(message)
+
+        daemon.executor.execute.assert_not_called()
+        daemon.executor._send_result_back.assert_called_once_with(
+            message,
+            "Relay auto-execution is disabled by receiver policy",
+            False,
         )
 
 
@@ -301,6 +394,8 @@ class AutoExecutorModelInvariantTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--settings") + 1], relay.ULTRACODE_SETTINGS)
         self.assertEqual(cmd[cmd.index("--fallback-model") + 1], relay.FALLBACK_MODEL)
         self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], relay.FALLBACK_MODEL)
+        self.assertNotIn("test task", cmd)
+        self.assertEqual(run.call_args.kwargs["input"], "test task")
         self.logger.info.assert_any_call(
             "AUTO-EXEC model normalized from %r to %s for sender %s",
             "sonnet",
@@ -424,6 +519,36 @@ class AutoExecutorModelInvariantTests(unittest.TestCase):
 
         self.assertNotIn("--fallback-model", run.call_args.args[0])
 
+    def test_option_shaped_task_bodies_are_inert_stdin_text(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="done", stderr="")
+
+        for task in ("--version", "--model claude-opus-5"):
+            with self.subTest(task=task):
+                self.executor.active = 1
+                with mock.patch.object(relay, "play_exec_alert"), \
+                        mock.patch.object(relay, "play_done_alert"), \
+                        mock.patch.object(relay.shutil, "which", return_value="/test/claude"), \
+                        mock.patch.object(
+                            self.executor,
+                            "_get_claude_capabilities",
+                            return_value=full_capability_report(),
+                        ), \
+                        mock.patch.object(
+                            relay.subprocess,
+                            "run",
+                            return_value=completed,
+                        ) as run:
+                    self.executor._run({
+                        "body": task,
+                        "model": relay.PRIMARY_MODEL,
+                        "from": "dawn",
+                    })
+
+                cmd = run.call_args.args[0]
+                self.assertNotIn(task, cmd)
+                self.assertEqual(run.call_args.kwargs["input"], task)
+                self.assertEqual(cmd[cmd.index("--model") + 1], relay.PRIMARY_MODEL)
+
 
 class CliModelInvariantTests(unittest.TestCase):
     def test_legacy_cli_model_is_validated_but_preserved_on_wire(self):
@@ -440,6 +565,41 @@ class CliModelInvariantTests(unittest.TestCase):
         message = request.call_args.args[1]["message"]
         self.assertEqual(message["model"], "opus")
 
+    def test_explicit_canonical_model_is_blocked_during_receiver_window(self):
+        with mock.patch.object(relay, "_uds_request") as request:
+            with self.assertRaisesRegex(ValueError, "receiver-first compatibility"):
+                relay.cli_send_via_daemon(
+                    "/tmp/test-relay.sock",
+                    "day",
+                    "test task",
+                    "dawn",
+                    auto=True,
+                    model=relay.PRIMARY_MODEL,
+                    model_explicit=True,
+                )
+
+        request.assert_not_called()
+
+    def test_canonical_config_default_is_allowed_after_receivers_are_upgraded(self):
+        with mock.patch.object(
+            relay,
+            "_uds_request",
+            return_value={"delivery": {"method": "tcp"}},
+        ) as request:
+            relay.cli_send_via_daemon(
+                "/tmp/test-relay.sock",
+                "day",
+                "test task",
+                "dawn",
+                auto=True,
+                model=relay.PRIMARY_MODEL,
+                model_explicit=False,
+                canonical_wire_ready=True,
+            )
+
+        message = request.call_args.args[1]["message"]
+        self.assertEqual(message["model"], relay.PRIMARY_MODEL)
+
     def test_unknown_cli_model_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unsupported model"):
             relay.cli_send_via_daemon(
@@ -450,6 +610,33 @@ class CliModelInvariantTests(unittest.TestCase):
                 auto=True,
                 model="gpt-5.6",
             )
+
+    def test_main_marks_command_line_model_as_explicit(self):
+        config = SimpleNamespace(
+            socket_path="/tmp/test-relay.sock",
+            default_budget=1.0,
+            wire_default_model="sonnet",
+            canonical_wire_ready=False,
+            machine="dawn",
+        )
+        argv = [
+            "relay.py",
+            "send",
+            "day",
+            "--auto",
+            "--model",
+            relay.PRIMARY_MODEL,
+            "test task",
+        ]
+
+        with mock.patch.object(relay, "Config", return_value=config), \
+                mock.patch.object(relay, "ALL_MACHINES", ["day"]), \
+                mock.patch.object(relay.sys, "argv", argv), \
+                mock.patch.object(relay, "cli_send_via_daemon") as send:
+            relay.main()
+
+        self.assertTrue(send.call_args.kwargs["model_explicit"])
+        self.assertFalse(send.call_args.kwargs["canonical_wire_ready"])
 
 
 if __name__ == "__main__":

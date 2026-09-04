@@ -69,25 +69,40 @@ present, the sender receives a failure result.
 During the compatibility window the CLI validates model names locally but
 preserves the caller's original model value on the wire. A legacy configured
 default likewise remains a legacy wire value while execution is canonicalized
-inside the receiver. Deploy receiver-first:
+inside the receiver. Even a canonical configured default is emitted as the
+compatible `sonnet` or `opus` alias until `canonical_wire_ready` is explicitly
+set to `true`. Explicit canonical `--model` values are refused while that gate
+is false; use `--model sonnet` for Fable 5.1 or `--model opus` for Opus 5. This
+mechanically prevents a new sender from placing a canonical name onto an old
+receiver's queue. Deploy receiver-first:
 
 1. Deploy the new `relay.py` to every receiving daemon while leaving existing
    `auto_execute` model settings unchanged.
 2. Run `python3 relay.py probe-claude` on each host and restart each daemon only
    after the probe passes.
-3. Verify old aliases are accepted by every upgraded receiver.
-4. Only then migrate each config to the canonical names shown above.
+3. Confirm every receiver reports relay 2.1.0 and accepts old aliases.
+4. Migrate each config to the canonical names shown above. Leave
+   `canonical_wire_ready` false until every receiver is verified; it may remain
+   false indefinitely with no change to the model that actually executes.
+5. Only after all receivers are upgraded may senders set
+   `canonical_wire_ready` true to emit canonical names on the wire.
 
 Rollback is the reverse compatibility operation: pause new auto-execution,
 drain queued messages while upgraded receivers can still normalize both name
-formats, restore legacy config names, then roll back senders and receivers.
+formats, set `canonical_wire_ready` false, restore legacy config names, then
+roll back senders and receivers.
 Never revert a receiver while canonical-model messages remain queued for it.
 
 An explicitly narrower `allowed_models` list remains narrower after upgrade.
-Unsupported entries are dropped with an audit warning; the full canonical pair
-is used only when the setting is absent or has no supported entries. A
-Fable-only allowlist also suppresses automatic Opus fallback. The subagent
-model remains Opus 5 as a separate fleetwide invariant.
+Unsupported entries are dropped with an audit warning. Only an absent
+`allowed_models` key receives the canonical pair; an explicitly empty or wholly
+invalid list disables auto-execution and refuses incoming tasks. A Fable-only
+allowlist also suppresses automatic Opus fallback. The subagent model remains
+Opus 5 as a separate fleetwide invariant.
+
+Task bodies are passed to Claude over standard input, never as command-line
+arguments. A body such as `--version` or `--model claude-opus-5` therefore
+remains inert user text and cannot change the relay's selected model or flags.
 
 ## Tests
 

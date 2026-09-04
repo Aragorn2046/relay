@@ -23,6 +23,7 @@
     "enabled": true,
     "max_concurrent": 2,
     "timeout": 300,
+    "canonical_wire_ready": false,
     "default_model": "claude-fable-5-1",
     "default_budget": 1.0,
     "max_budget": 5.0,

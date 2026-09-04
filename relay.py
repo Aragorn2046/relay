@@ -40,7 +40,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 DEFAULT_PORT = 7272
 MAX_MESSAGE_SIZE = 1_048_576  # 1 MB
 HMAC_MAX_AGE = 300.0  # 5 minutes
@@ -53,6 +53,8 @@ EXECUTION_TIMEOUT = 300  # 5 minutes
 PRIMARY_MODEL = "claude-fable-5-1"
 FALLBACK_MODEL = "claude-opus-5"
 ALLOWED_MODELS = (PRIMARY_MODEL, FALLBACK_MODEL)
+LEGACY_WIRE_MODELS = frozenset({"sonnet", "opus"})
+WIRE_COMPATIBILITY_MODE = True
 CLAUDE_REQUIRED_FLAGS = (
     "--model",
     "--settings",
@@ -328,6 +330,7 @@ class Config:
         ae = self.data.get("auto_execute", {})
         self.model_policy_events = []
         self.auto_execute_enabled = ae.get("enabled", True)
+        self.canonical_wire_ready = ae.get("canonical_wire_ready", False) is True
         self.max_concurrent = ae.get("max_concurrent", 2)
         self.exec_timeout = ae.get("timeout", EXECUTION_TIMEOUT)
         raw_default_model = ae.get("default_model", PRIMARY_MODEL)
@@ -346,9 +349,10 @@ class Config:
         self.default_budget = ae.get("default_budget", 1.0)
         self.max_budget = ae.get("max_budget", 5.0)
 
+        allowed_models_present = "allowed_models" in ae
         raw_allowed_models = ae.get("allowed_models")
         normalized_allowed = []
-        if raw_allowed_models is not None:
+        if allowed_models_present:
             candidates = raw_allowed_models if isinstance(raw_allowed_models, list) else [raw_allowed_models]
             for candidate in candidates:
                 normalized = normalize_model(candidate)
@@ -366,16 +370,21 @@ class Config:
                 if normalized not in normalized_allowed:
                     normalized_allowed.append(normalized)
 
-        # Preserve a deliberate narrower allowlist. Only absent or wholly
-        # invalid/empty configuration receives the canonical full pair.
-        self.allowed_models = normalized_allowed or list(ALLOWED_MODELS)
-        if raw_allowed_models is not None and not normalized_allowed:
+        # Only an absent key receives defaults. An explicit empty or wholly
+        # invalid list is a fail-closed operator decision.
+        self.allowed_models = (
+            list(ALLOWED_MODELS)
+            if not allowed_models_present
+            else normalized_allowed
+        )
+        if allowed_models_present and not normalized_allowed:
+            self.auto_execute_enabled = False
             self.model_policy_events.append((
                 "warning",
-                "Configured allowed_models had no supported entries; using the canonical model pair",
+                "Configured allowed_models had no supported entries; auto-execution is disabled",
             ))
 
-        if normalized_default not in self.allowed_models:
+        if self.allowed_models and normalized_default not in self.allowed_models:
             replacement = next(
                 (model for model in ALLOWED_MODELS if model in self.allowed_models),
                 self.allowed_models[0],
@@ -386,11 +395,21 @@ class Config:
             ))
             normalized_default = replacement
         self.default_model = normalized_default
-        self.wire_default_model = (
-            raw_default_model
-            if normalize_model(raw_default_model) == self.default_model
-            else self.default_model
-        )
+        if not self.canonical_wire_ready:
+            self.wire_default_model = (
+                "sonnet" if self.default_model == PRIMARY_MODEL else "opus"
+            )
+            if raw_default_model != self.wire_default_model:
+                self.model_policy_events.append((
+                    "info",
+                    f"Compatibility wire default: {raw_default_model!r} -> {self.wire_default_model}",
+                ))
+        else:
+            self.wire_default_model = (
+                raw_default_model
+                if normalize_model(raw_default_model) == self.default_model
+                else self.default_model
+            )
 
         # Secret
         secret_file = self._expand(self.data.get("secret_file", "~/.relay-secret"))
@@ -638,7 +657,7 @@ class AutoExecutor:
         self.capability_cache = {}
 
     def _get_claude_capabilities(self, claude_bin, env):
-        """Probe once per installed binary revision and emit a safe audit line."""
+        """Cache successful probes per binary revision; retry failures next task."""
         try:
             stat = Path(claude_bin).stat()
             cache_key = (claude_bin, stat.st_mtime_ns, stat.st_size)
@@ -651,14 +670,17 @@ class AutoExecutor:
                 return cached
 
             report = probe_claude_capabilities(claude_bin, env)
-            self.capability_cache = {cache_key: report}
             if report["ok"]:
+                self.capability_cache = {cache_key: report}
                 self.logger.info(
                     "Claude CLI capability probe passed: version=%s flags=%s",
                     report["version"],
                     ",".join(report["supported_flags"]),
                 )
             else:
+                # Transient help/parser failures must recover on the next task;
+                # only successful capability evidence is safe to cache.
+                self.capability_cache.clear()
                 self.logger.error(
                     "Claude CLI capability probe failed: version=%s error=%s",
                     report["version"],
@@ -687,6 +709,16 @@ class AutoExecutor:
 
     def _run(self, msg):
         task = msg.get("body", msg.get("message", ""))
+        if not isinstance(task, str):
+            self.logger.warning(
+                "AUTO-EXEC rejected: task body must be text (sender=%s)",
+                msg.get("from", "unknown"),
+            )
+            if msg.get("reply_to"):
+                self._send_result_back(msg, "Relay task body must be text", False)
+            with self.lock:
+                self.active -= 1
+            return
         budget = min(float(msg.get("budget", self.config.default_budget)), self.config.max_budget)
         requested_model = msg.get("model", self.config.default_model)
         model = normalize_model(requested_model)
@@ -758,13 +790,14 @@ class AutoExecutor:
                 and "--fallback-model" not in capabilities["missing_optional"]
             ):
                 cmd.extend(["--fallback-model", FALLBACK_MODEL])
-            cmd.extend(["--max-budget-usd", str(budget), "--print", task])
+            cmd.extend(["--max-budget-usd", str(budget), "--print"])
             cwd = str(home / "workspace")
             if not Path(cwd).exists():
                 cwd = str(home)
 
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
+                input=task,
                 timeout=self.config.exec_timeout, cwd=cwd, env=env
             )
             result = proc.stdout or ""
@@ -952,6 +985,19 @@ class RelayDaemon:
         tags = message.get("tags", [])
 
         if auto or "AUTO" in tags:
+            if not self.config.auto_execute_enabled:
+                self.logger.warning(
+                    "AUTO-EXEC refused: auto-execution is disabled (sender=%s)",
+                    sender,
+                )
+                if message.get("reply_to"):
+                    await asyncio.to_thread(
+                        self.executor._send_result_back,
+                        message,
+                        "Relay auto-execution is disabled by receiver policy",
+                        False,
+                    )
+                return
             if self.executor.can_accept():
                 self.executor.execute(message)
             else:
@@ -1334,7 +1380,9 @@ def cli_send_via_daemon(
     machine_name,
     auto=False,
     budget=1.0,
-    model=PRIMARY_MODEL,
+    model="sonnet",
+    model_explicit=True,
+    canonical_wire_ready=False,
 ):
     """Send a message through the local daemon."""
     message = {
@@ -1349,6 +1397,17 @@ def cli_send_via_daemon(
         validated_model = normalize_model(requested_model)
         if validated_model is None:
             raise ValueError(f"Unsupported model: {requested_model}")
+        if (
+            WIRE_COMPATIBILITY_MODE
+            and not canonical_wire_ready
+            and requested_model not in LEGACY_WIRE_MODELS
+        ):
+            source = "explicit --model" if model_explicit else "configured default"
+            raise ValueError(
+                f"During receiver-first compatibility rollout, {source} must use "
+                "the legacy wire alias 'sonnet' or 'opus'; canonical wire names require "
+                "canonical_wire_ready after every receiver is upgraded"
+            )
         message["budget"] = budget
         # Compatibility window: validate locally, but preserve the caller's
         # wire value until every receiver has shipped normalization support.
@@ -1681,6 +1740,7 @@ def main():
         auto = False
         budget = config.default_budget
         model = config.wire_default_model
+        model_explicit = False
         msg_parts = []
         i = 0
         while i < len(args):
@@ -1692,6 +1752,7 @@ def main():
             elif args[i] == "--model" and i + 1 < len(args):
                 i += 1
                 model = args[i]
+                model_explicit = True
             else:
                 msg_parts.append(args[i])
             i += 1
@@ -1709,6 +1770,8 @@ def main():
                 auto=auto,
                 budget=budget,
                 model=model,
+                model_explicit=model_explicit,
+                canonical_wire_ready=config.canonical_wire_ready,
             )
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
