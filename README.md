@@ -66,15 +66,14 @@ This includes dated vendor IDs such as `claude-3-5-sonnet-20240620` and
 `claude-3-opus-20240229`. Unknown families are rejected and, when `reply_to` is
 present, the sender receives a failure result.
 
-During the compatibility window the CLI validates model names locally but
-preserves the caller's original model value on the wire. A legacy configured
-default likewise remains a legacy wire value while execution is canonicalized
-inside the receiver. Even a canonical configured default is emitted as the
-compatible `sonnet` or `opus` alias until `canonical_wire_ready` is explicitly
-set to `true`. Explicit canonical `--model` values are refused while that gate
-is false; use `--model sonnet` for Fable 5.1 or `--model opus` for Opus 5. This
-mechanically prevents a new sender from placing a canonical name onto an old
-receiver's queue. Deploy receiver-first:
+During the compatibility window the CLI validates and normalizes every accepted
+model spelling locally, then emits only the compatible `sonnet` or `opus` wire
+alias. That includes explicit canonical `--model` values and legacy aliases
+with harmless case, spacing, or provider-prefix differences. Once
+`canonical_wire_ready` is explicitly set to `true`, the sender emits canonical
+names instead. This mechanically prevents a new sender from placing a canonical
+name onto an old receiver's queue without refusing an otherwise valid task.
+Deploy receiver-first:
 
 1. Deploy the new `relay.py` to every receiving daemon while leaving existing
    `auto_execute` model settings unchanged.
@@ -103,6 +102,9 @@ Opus 5 as a separate fleetwide invariant.
 Task bodies are passed to Claude over standard input, never as command-line
 arguments. A body such as `--version` or `--model claude-opus-5` therefore
 remains inert user text and cannot change the relay's selected model or flags.
+The Claude capability probe treats `--effort` as required and fails closed when
+it is unavailable; the settings overlay is defense in depth, not a substitute
+for the explicit xhigh effort argument.
 
 ## Tests
 

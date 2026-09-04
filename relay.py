@@ -53,15 +53,15 @@ EXECUTION_TIMEOUT = 300  # 5 minutes
 PRIMARY_MODEL = "claude-fable-5-1"
 FALLBACK_MODEL = "claude-opus-5"
 ALLOWED_MODELS = (PRIMARY_MODEL, FALLBACK_MODEL)
-LEGACY_WIRE_MODELS = frozenset({"sonnet", "opus"})
 WIRE_COMPATIBILITY_MODE = True
 CLAUDE_REQUIRED_FLAGS = (
     "--model",
     "--settings",
+    "--effort",
     "--max-budget-usd",
     "--print",
 )
-CLAUDE_OPTIONAL_FLAGS = ("--effort", "--fallback-model")
+CLAUDE_OPTIONAL_FLAGS = ("--fallback-model",)
 ULTRACODE_SETTINGS = '{"ultracode":true,"effortLevel":"xhigh"}'
 
 
@@ -194,9 +194,8 @@ def probe_claude_capabilities(claude_bin, env):
             claude_bin,
             "--model", PRIMARY_MODEL,
             "--settings", ULTRACODE_SETTINGS,
+            "--effort", "xhigh",
         ]
-        if "--effort" not in missing_optional:
-            smoke_cmd.extend(["--effort", "xhigh"])
         if "--fallback-model" not in missing_optional:
             smoke_cmd.extend(["--fallback-model", FALLBACK_MODEL])
         smoke_cmd.extend(["--max-budget-usd", "0.01", "--print", "--help"])
@@ -686,10 +685,6 @@ class AutoExecutor:
                     report["version"],
                     report["error"],
                 )
-            if "--effort" in report["missing_optional"]:
-                self.logger.warning(
-                    "Claude CLI lacks --effort; using effortLevel=xhigh in the settings overlay"
-                )
             if "--fallback-model" in report["missing_optional"]:
                 self.logger.warning(
                     "Claude CLI lacks --fallback-model; automatic fallback is disabled rather than substituting another model"
@@ -781,9 +776,8 @@ class AutoExecutor:
                 claude_bin,
                 "--model", model,
                 "--settings", ULTRACODE_SETTINGS,
+                "--effort", "xhigh",
             ]
-            if "--effort" not in capabilities["missing_optional"]:
-                cmd.extend(["--effort", "xhigh"])
             if (
                 model == PRIMARY_MODEL
                 and FALLBACK_MODEL in self.config.allowed_models
@@ -1397,21 +1391,14 @@ def cli_send_via_daemon(
         validated_model = normalize_model(requested_model)
         if validated_model is None:
             raise ValueError(f"Unsupported model: {requested_model}")
-        if (
-            WIRE_COMPATIBILITY_MODE
-            and not canonical_wire_ready
-            and requested_model not in LEGACY_WIRE_MODELS
-        ):
-            source = "explicit --model" if model_explicit else "configured default"
-            raise ValueError(
-                f"During receiver-first compatibility rollout, {source} must use "
-                "the legacy wire alias 'sonnet' or 'opus'; canonical wire names require "
-                "canonical_wire_ready after every receiver is upgraded"
-            )
+        wire_model = validated_model
+        if WIRE_COMPATIBILITY_MODE and not canonical_wire_ready:
+            # Old receivers understand only these two names. Normalize every
+            # accepted spelling locally, then emit a single safe alias until
+            # the receiver-first rollout is complete.
+            wire_model = "sonnet" if validated_model == PRIMARY_MODEL else "opus"
         message["budget"] = budget
-        # Compatibility window: validate locally, but preserve the caller's
-        # wire value until every receiver has shipped normalization support.
-        message["model"] = requested_model
+        message["model"] = wire_model
         message["reply_to"] = machine_name
         message["tags"] = ["AUTO"]
 

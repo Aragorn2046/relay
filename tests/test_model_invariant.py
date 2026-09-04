@@ -238,7 +238,7 @@ class ClaudeCapabilityProbeTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(report["missing_optional"], list(relay.CLAUDE_OPTIONAL_FLAGS))
         smoke_cmd = run.call_args_list[2].args[0]
-        self.assertNotIn("--effort", smoke_cmd)
+        self.assertEqual(smoke_cmd[smoke_cmd.index("--effort") + 1], "xhigh")
         self.assertNotIn("--fallback-model", smoke_cmd)
 
     def test_missing_required_flag_fails_the_probe(self):
@@ -256,6 +256,28 @@ class ClaudeCapabilityProbeTests(unittest.TestCase):
 
         self.assertFalse(report["ok"])
         self.assertEqual(report["missing_required"], ["--settings"])
+
+    def test_missing_effort_fails_the_probe(self):
+        present_flags = [
+            flag for flag in relay.CLAUDE_REQUIRED_FLAGS if flag != "--effort"
+        ]
+        results = [
+            subprocess.CompletedProcess([], 0, stdout="test-version", stderr=""),
+            *[
+                subprocess.CompletedProcess(
+                    [], 0, stdout=" ".join(present_flags), stderr="",
+                )
+                for _ in range(4)
+            ],
+        ]
+
+        with mock.patch.object(relay.subprocess, "run", side_effect=results):
+            report = relay.probe_claude_capabilities(
+                "/test/claude", {"PATH": "/test"},
+            )
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["missing_required"], ["--effort"])
 
     def test_transient_help_timeout_is_retried(self):
         help_text = " ".join((*relay.CLAUDE_REQUIRED_FLAGS, *relay.CLAUDE_OPTIONAL_FLAGS))
@@ -441,7 +463,7 @@ class AutoExecutorModelInvariantTests(unittest.TestCase):
         self.assertNotIn("--fallback-model", cmd)
         self.assertEqual(self.executor.active, 0)
 
-    def test_missing_optional_flags_degrades_safely_without_changing_models(self):
+    def test_missing_optional_fallback_degrades_without_changing_models(self):
         self.executor.active = 1
         capabilities = full_capability_report()
         capabilities["missing_optional"] = list(relay.CLAUDE_OPTIONAL_FLAGS)
@@ -463,7 +485,7 @@ class AutoExecutorModelInvariantTests(unittest.TestCase):
             })
 
         cmd = run.call_args.args[0]
-        self.assertNotIn("--effort", cmd)
+        self.assertEqual(cmd[cmd.index("--effort") + 1], "xhigh")
         self.assertNotIn("--fallback-model", cmd)
         self.assertEqual(cmd[cmd.index("--settings") + 1], relay.ULTRACODE_SETTINGS)
         self.assertEqual(cmd[cmd.index("--model") + 1], relay.PRIMARY_MODEL)
@@ -565,20 +587,49 @@ class CliModelInvariantTests(unittest.TestCase):
         message = request.call_args.args[1]["message"]
         self.assertEqual(message["model"], "opus")
 
-    def test_explicit_canonical_model_is_blocked_during_receiver_window(self):
-        with mock.patch.object(relay, "_uds_request") as request:
-            with self.assertRaisesRegex(ValueError, "receiver-first compatibility"):
+    def test_explicit_canonical_model_uses_legacy_wire_alias_during_receiver_window(self):
+        with mock.patch.object(
+            relay,
+            "_uds_request",
+            return_value={"delivery": {"method": "tcp"}},
+        ) as request:
+            relay.cli_send_via_daemon(
+                "/tmp/test-relay.sock",
+                "day",
+                "test task",
+                "dawn",
+                auto=True,
+                model=relay.PRIMARY_MODEL,
+                model_explicit=True,
+            )
+
+        message = request.call_args.args[1]["message"]
+        self.assertEqual(message["model"], "sonnet")
+
+    def test_accepted_model_spellings_collapse_to_safe_wire_aliases(self):
+        cases = {
+            " FABLE ": "sonnet",
+            "Anthropic/Claude-Fable-5-1": "sonnet",
+            " OPUS ": "opus",
+            "anthropic:claude-opus-5": "opus",
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model), mock.patch.object(
+                relay,
+                "_uds_request",
+                return_value={"delivery": {"method": "tcp"}},
+            ) as request:
                 relay.cli_send_via_daemon(
                     "/tmp/test-relay.sock",
                     "day",
                     "test task",
                     "dawn",
                     auto=True,
-                    model=relay.PRIMARY_MODEL,
+                    model=model,
                     model_explicit=True,
                 )
-
-        request.assert_not_called()
+                message = request.call_args.args[1]["message"]
+                self.assertEqual(message["model"], expected)
 
     def test_canonical_config_default_is_allowed_after_receivers_are_upgraded(self):
         with mock.patch.object(
