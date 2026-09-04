@@ -7,6 +7,7 @@ TCP-primary message relay for cross-machine communication over Tailscale.
 - **TCP transport** over Tailscale mesh with file-based fallback
 - **HMAC-SHA256** message authentication with pre-shared secret
 - **Auto-execution** of tagged messages via Claude CLI (budget-capped, model-allowlisted)
+- **Pinned model policy** — Fable 5.1 at Ultra Code effort, with Opus 5 as the only fallback
 - **Deduplication**, rate limiting, and message archiving
 - **Zero dependencies** — Python 3.9+ stdlib only
 

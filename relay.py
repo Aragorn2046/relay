@@ -6,7 +6,7 @@ Unified daemon + CLI. Replaces the old file-based relay.py + relay-watcher.py.
 Usage (CLI):
     relay.py send <target> "message"          Send a message
     relay.py send <target> --auto "task"      Send for auto-execution
-    relay.py send <target> --auto --budget 2.0 --model opus "task"
+    relay.py send <target> --auto --budget 2.0 --model claude-opus-5 "task"
     relay.py check                            Check for unread messages
     relay.py read                             Read and archive unread messages
     relay.py status                           Show relay system status
@@ -48,6 +48,35 @@ DEDUP_TTL = 3600.0  # 1 hour
 TCP_CONNECT_TIMEOUT = 2.0
 TCP_READ_TIMEOUT = 5.0
 EXECUTION_TIMEOUT = 300  # 5 minutes
+PRIMARY_MODEL = "claude-fable-5-1"
+FALLBACK_MODEL = "claude-opus-5"
+ALLOWED_MODELS = (PRIMARY_MODEL, FALLBACK_MODEL)
+
+
+def normalize_model(model):
+    """Return the canonical relay model for a supported current or legacy name."""
+    if not isinstance(model, str):
+        return None
+
+    normalized = model.strip().lower().replace("_", "-")
+    for provider_prefix in ("anthropic:", "anthropic/"):
+        if normalized.startswith(provider_prefix):
+            normalized = normalized.removeprefix(provider_prefix)
+            break
+
+    if normalized in ALLOWED_MODELS:
+        return normalized
+
+    parts = normalized.split("-")
+    if parts and parts[0] == "claude":
+        parts = parts[1:]
+    family = parts[0] if parts else ""
+
+    if family in {"fable", "sonnet", "haiku"}:
+        return PRIMARY_MODEL
+    if family == "opus":
+        return FALLBACK_MODEL
+    return None
 
 # ── Machine Detection ──
 
@@ -156,10 +185,12 @@ class Config:
         self.auto_execute_enabled = ae.get("enabled", True)
         self.max_concurrent = ae.get("max_concurrent", 2)
         self.exec_timeout = ae.get("timeout", EXECUTION_TIMEOUT)
-        self.default_model = ae.get("default_model", "sonnet")
+        self.default_model = normalize_model(ae.get("default_model", PRIMARY_MODEL)) or PRIMARY_MODEL
         self.default_budget = ae.get("default_budget", 1.0)
         self.max_budget = ae.get("max_budget", 5.0)
-        self.allowed_models = ae.get("allowed_models", ["sonnet", "opus", "haiku"])
+        # This is a fleet invariant rather than a configurable expansion point:
+        # stale configs may name legacy aliases, but no third model may execute.
+        self.allowed_models = list(ALLOWED_MODELS)
 
         # Secret
         secret_file = self._expand(self.data.get("secret_file", "~/.relay-secret"))
@@ -418,9 +449,10 @@ class AutoExecutor:
     def _run(self, msg):
         task = msg.get("body", msg.get("message", ""))
         budget = min(float(msg.get("budget", self.config.default_budget)), self.config.max_budget)
-        model = msg.get("model", self.config.default_model)
+        requested_model = msg.get("model", self.config.default_model)
+        model = normalize_model(requested_model)
         if model not in self.config.allowed_models:
-            self.logger.warning(f"AUTO-EXEC rejected: invalid model '{model}' from {msg.get('from', 'unknown')}")
+            self.logger.warning(f"AUTO-EXEC rejected: invalid model '{requested_model}' from {msg.get('from', 'unknown')}")
             with self.lock:
                 self.active -= 1
             return
@@ -435,6 +467,7 @@ class AutoExecutor:
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
+        env["CLAUDE_CODE_SUBAGENT_MODEL"] = FALLBACK_MODEL
         # Daemons spawned outside an interactive shell don't inherit fnm/Homebrew
         # PATH entries, so `claude` isn't resolvable. Prepend the common install
         # locations so subprocess can find the binary on both WSL and macOS.
@@ -454,7 +487,15 @@ class AutoExecutor:
                 raise FileNotFoundError(
                     f"'claude' binary not on PATH. Looked in: {extra_path}"
                 )
-            cmd = [claude_bin, "--model", model, "--max-budget-usd", str(budget), "-p", task]
+            cmd = [
+                claude_bin,
+                "--model", model,
+                "--effort", "xhigh",
+                "--settings", '{"ultracode":true}',
+            ]
+            if model == PRIMARY_MODEL:
+                cmd.extend(["--fallback-model", FALLBACK_MODEL])
+            cmd.extend(["--max-budget-usd", str(budget), "-p", task])
             cwd = str(home / "workspace")
             if not Path(cwd).exists():
                 cwd = str(home)
@@ -1021,7 +1062,15 @@ class RelayDaemon:
 
 # ── CLI Client ──
 
-def cli_send_via_daemon(socket_path, target, body, machine_name, auto=False, budget=1.0, model="sonnet"):
+def cli_send_via_daemon(
+    socket_path,
+    target,
+    body,
+    machine_name,
+    auto=False,
+    budget=1.0,
+    model=PRIMARY_MODEL,
+):
     """Send a message through the local daemon."""
     message = {
         "from": machine_name,
@@ -1031,6 +1080,10 @@ def cli_send_via_daemon(socket_path, target, body, machine_name, auto=False, bud
         "auto_execute": auto,
     }
     if auto:
+        requested_model = model
+        model = normalize_model(requested_model)
+        if model is None:
+            raise ValueError(f"Unsupported model: {requested_model}")
         message["budget"] = budget
         message["model"] = model
         message["reply_to"] = machine_name
@@ -1353,7 +1406,19 @@ def main():
             print("Usage: relay.py send <dawn|dusk|day> [--auto] [--budget N] [--model M] \"message\"")
             sys.exit(1)
 
-        cli_send_via_daemon(socket_path, target, body, config.machine, auto=auto, budget=budget, model=model)
+        try:
+            cli_send_via_daemon(
+                socket_path,
+                target,
+                body,
+                config.machine,
+                auto=auto,
+                budget=budget,
+                model=model,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
 
     elif command == "check":
         cli_check(socket_path)
