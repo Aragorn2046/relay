@@ -213,7 +213,10 @@ class ClaudeCapabilityProbeTests(unittest.TestCase):
             relay.FALLBACK_MODEL,
         )
         self.assertEqual(smoke_cmd[-1], "--help")
-        self.assertEqual(smoke_cmd[smoke_cmd.index("--effort") + 1], "xhigh")
+        self.assertEqual(
+            smoke_cmd[smoke_cmd.index("--effort") + 1],
+            relay.ULTRACODE_EFFORT,
+        )
         self.assertEqual(
             smoke_cmd[smoke_cmd.index("--fallback-model") + 1],
             relay.FALLBACK_MODEL,
@@ -238,7 +241,10 @@ class ClaudeCapabilityProbeTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(report["missing_optional"], list(relay.CLAUDE_OPTIONAL_FLAGS))
         smoke_cmd = run.call_args_list[2].args[0]
-        self.assertEqual(smoke_cmd[smoke_cmd.index("--effort") + 1], "xhigh")
+        self.assertEqual(
+            smoke_cmd[smoke_cmd.index("--effort") + 1],
+            relay.ULTRACODE_EFFORT,
+        )
         self.assertNotIn("--fallback-model", smoke_cmd)
 
     def test_missing_required_flag_fails_the_probe(self):
@@ -394,7 +400,7 @@ class AutoExecutorModelInvariantTests(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
-    def test_legacy_request_launches_fable_5_1_at_xhigh_with_opus_5_subagents(self):
+    def test_legacy_request_launches_fable_5_1_at_ultracode_with_opus_5_subagents(self):
         self.executor.active = 1
         completed = subprocess.CompletedProcess([], 0, stdout="done", stderr="")
 
@@ -412,7 +418,9 @@ class AutoExecutorModelInvariantTests(unittest.TestCase):
         cmd = run.call_args.args[0]
         env = run.call_args.kwargs["env"]
         self.assertEqual(cmd[cmd.index("--model") + 1], relay.PRIMARY_MODEL)
-        self.assertEqual(cmd[cmd.index("--effort") + 1], "xhigh")
+        self.assertEqual(
+            cmd[cmd.index("--effort") + 1], relay.ULTRACODE_EFFORT,
+        )
         self.assertEqual(cmd[cmd.index("--settings") + 1], relay.ULTRACODE_SETTINGS)
         self.assertEqual(cmd[cmd.index("--fallback-model") + 1], relay.FALLBACK_MODEL)
         self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], relay.FALLBACK_MODEL)
@@ -485,7 +493,9 @@ class AutoExecutorModelInvariantTests(unittest.TestCase):
             })
 
         cmd = run.call_args.args[0]
-        self.assertEqual(cmd[cmd.index("--effort") + 1], "xhigh")
+        self.assertEqual(
+            cmd[cmd.index("--effort") + 1], relay.ULTRACODE_EFFORT,
+        )
         self.assertNotIn("--fallback-model", cmd)
         self.assertEqual(cmd[cmd.index("--settings") + 1], relay.ULTRACODE_SETTINGS)
         self.assertEqual(cmd[cmd.index("--model") + 1], relay.PRIMARY_MODEL)

@@ -62,7 +62,8 @@ CLAUDE_REQUIRED_FLAGS = (
     "--print",
 )
 CLAUDE_OPTIONAL_FLAGS = ("--fallback-model",)
-ULTRACODE_SETTINGS = '{"ultracode":true,"effortLevel":"xhigh"}'
+ULTRACODE_EFFORT = "ultracode"
+ULTRACODE_SETTINGS = '{"ultracode":true}'
 
 
 def normalize_model(model):
@@ -194,7 +195,7 @@ def probe_claude_capabilities(claude_bin, env):
             claude_bin,
             "--model", PRIMARY_MODEL,
             "--settings", ULTRACODE_SETTINGS,
-            "--effort", "xhigh",
+            "--effort", ULTRACODE_EFFORT,
         ]
         if "--fallback-model" not in missing_optional:
             smoke_cmd.extend(["--fallback-model", FALLBACK_MODEL])
@@ -776,7 +777,7 @@ class AutoExecutor:
                 claude_bin,
                 "--model", model,
                 "--settings", ULTRACODE_SETTINGS,
-                "--effort", "xhigh",
+                "--effort", ULTRACODE_EFFORT,
             ]
             if (
                 model == PRIMARY_MODEL

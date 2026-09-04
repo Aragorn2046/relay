@@ -104,7 +104,7 @@ arguments. A body such as `--version` or `--model claude-opus-5` therefore
 remains inert user text and cannot change the relay's selected model or flags.
 The Claude capability probe treats `--effort` as required and fails closed when
 it is unavailable; the settings overlay is defense in depth, not a substitute
-for the explicit xhigh effort argument.
+for the explicit native `ultracode` effort argument.
 
 ## Tests
 
