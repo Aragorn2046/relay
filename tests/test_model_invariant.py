@@ -1,4 +1,6 @@
+import asyncio
 import json
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -7,6 +9,43 @@ from types import SimpleNamespace
 from unittest import mock
 
 import relay
+
+
+class FakeReader:
+    def __init__(self, payload):
+        self.payload = bytearray(payload)
+
+    async def readexactly(self, size):
+        if len(self.payload) < size:
+            raise EOFError("short fake read")
+        chunk = bytes(self.payload[:size])
+        del self.payload[:size]
+        return chunk
+
+
+class FakeWriter:
+    def __init__(self):
+        self.payload = bytearray()
+        self.closed = False
+
+    def get_extra_info(self, name):
+        return ("127.0.0.1", 12345) if name == "peername" else None
+
+    def write(self, payload):
+        self.payload.extend(payload)
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        return None
+
+    def response(self):
+        size = struct.unpack("!I", self.payload[:4])[0]
+        return json.loads(bytes(self.payload[4:4 + size]).decode("utf-8"))
 
 
 def full_capability_report():
@@ -204,6 +243,12 @@ class ConfigModelInvariantTests(unittest.TestCase):
             for level, event in config.model_policy_events
             if level == "warning"
         ))
+
+    def test_activation_hold_lookup_fails_closed_on_filesystem_error(self):
+        config = self._load_config({"default_model": "sonnet"})
+
+        with mock.patch.object(relay.os, "lstat", side_effect=PermissionError):
+            self.assertTrue(config.activation_held())
 
 
 class ClaudeCapabilityProbeTests(unittest.TestCase):
@@ -419,6 +464,7 @@ class DisabledAutoExecutionTests(unittest.IsolatedAsyncioTestCase):
             log_dir=Path("/tmp"),
             model_policy_events=[],
             auto_execute_enabled=False,
+            activation_held=lambda: False,
         )
         with mock.patch.object(relay.RelayDaemon, "_setup_logging", return_value=logger):
             daemon = relay.RelayDaemon(config)
@@ -438,6 +484,181 @@ class DisabledAutoExecutionTests(unittest.IsolatedAsyncioTestCase):
             "Relay auto-execution is disabled by receiver policy",
             False,
         )
+
+
+class ActivationHoldTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmpdir.name)
+        self.relay_root = self.root / "relay-data"
+        self.relay_root.mkdir()
+        self.secret = "test-only-secret"
+        secret_path = self.root / "relay-secret"
+        secret_path.write_text(self.secret)
+        secret_path.chmod(0o600)
+        self.hold_path = self.root / "activation.hold"
+        self.config_path = self.root / "config.json"
+        self.config_path.write_text(json.dumps({
+            "machine": "test",
+            "peers": {
+                "test": {"ip": "127.0.0.1"},
+                "dawn": {"ip": "127.0.0.2"},
+            },
+            "secret_file": str(secret_path),
+            "log_dir": str(self.root / "logs"),
+            "file_fallback": {"vault_path": str(self.relay_root)},
+            "auto_execute": {
+                "enabled": True,
+                "activation_hold_sentinel": str(self.hold_path),
+            },
+        }))
+        self.poll_patch = mock.patch.object(relay, "FILE_POLL_INTERVAL", 0.01)
+        self.poll_patch.start()
+
+    def tearDown(self):
+        self.poll_patch.stop()
+        self.tmpdir.cleanup()
+
+    def _config(self, enabled=True):
+        data = json.loads(self.config_path.read_text())
+        data["auto_execute"]["enabled"] = enabled
+        self.config_path.write_text(json.dumps(data))
+        with mock.patch.object(relay, "detect_tailscale_ip", return_value="127.0.0.1"):
+            return relay.Config(self.config_path)
+
+    def _daemon(self, enabled=True):
+        logger = mock.Mock()
+        with mock.patch.object(relay.RelayDaemon, "_setup_logging", return_value=logger):
+            daemon = relay.RelayDaemon(self._config(enabled=enabled))
+        daemon.executor = mock.Mock()
+        daemon.executor.can_accept.return_value = True
+        return daemon
+
+    def _auto_message(self, body):
+        return relay.sign_message({
+            "from": "dawn",
+            "to": "test",
+            "type": "exec",
+            "body": body,
+            "auto_execute": True,
+            "tags": ["AUTO"],
+            "reply_to": "dawn",
+        }, self.secret)
+
+    async def test_hold_survives_restart_and_queues_simultaneous_tcp_auto(self):
+        inbox = self.relay_root / "inbox-test"
+        preexisting = self._auto_message("preexisting file task")
+        preexisting_path = relay.write_message_file_atomic(inbox, "dawn", preexisting)
+        self.hold_path.write_text("release hold\n")
+        before = preexisting_path.read_bytes()
+
+        first_daemon = self._daemon()
+        first_daemon.shutdown_event = asyncio.Event()
+        first_watcher = asyncio.create_task(first_daemon.watch_file_inbox())
+        await asyncio.sleep(0.03)
+        self.assertEqual(preexisting_path.read_bytes(), before)
+        first_daemon.executor.execute.assert_not_called()
+
+        tcp_message = self._auto_message("simultaneous tcp task")
+        reader = FakeReader(relay.frame_and_encode(tcp_message))
+        writer = FakeWriter()
+        await first_daemon.handle_tcp_client(reader, writer)
+        response = writer.response()
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["note"], "queued_activation_hold")
+        self.assertTrue(response["activation_held"])
+        self.assertTrue(response["held"])
+        first_daemon.executor.execute.assert_not_called()
+
+        held_files = sorted(inbox.glob("*.json"))
+        self.assertEqual(len(held_files), 2)
+        held_bytes = {path.name: path.read_bytes() for path in held_files}
+        queued_tcp = [
+            json.loads(path.read_text())
+            for path in held_files
+            if json.loads(path.read_text()).get("body") == "simultaneous tcp task"
+        ]
+        self.assertEqual(len(queued_tcp), 1)
+        self.assertIn("signature", queued_tcp[0])
+        self.assertTrue(relay.verify_message(queued_tcp[0], self.secret))
+
+        retry_writer = FakeWriter()
+        await first_daemon.handle_tcp_client(
+            FakeReader(relay.frame_and_encode(tcp_message)),
+            retry_writer,
+        )
+        self.assertEqual(retry_writer.response()["note"], "queued_activation_hold")
+        self.assertEqual(len(list(inbox.glob("*.json"))), 2)
+
+        first_daemon.shutdown_event.set()
+        await first_watcher
+
+        # A fresh daemon represents restart under the same persistent hold.
+        restarted = self._daemon()
+        restarted.shutdown_event = asyncio.Event()
+        restarted_watcher = asyncio.create_task(restarted.watch_file_inbox())
+        await asyncio.sleep(0.03)
+        for path in held_files:
+            self.assertEqual(path.read_bytes(), held_bytes[path.name])
+        restarted.executor.execute.assert_not_called()
+        self.assertTrue(restarted._get_status()["activation_held"])
+        self.assertTrue(restarted._get_status()["held"])
+        self.assertTrue(restarted._read_file_inbox()["activation_held"])
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in held_files}, held_bytes
+        )
+
+        ping_writer = FakeWriter()
+        await restarted.handle_tcp_client(
+            FakeReader(relay.frame_and_encode({"type": "ping"})),
+            ping_writer,
+        )
+        self.assertEqual(ping_writer.response()["type"], "pong")
+        self.assertTrue(ping_writer.response()["activation_held"])
+        self.assertTrue(ping_writer.response()["held"])
+
+        health_writer = FakeWriter()
+        await restarted.handle_uds_client(
+            FakeReader(relay.frame_and_encode({"cmd": "health"})),
+            health_writer,
+        )
+        self.assertEqual(health_writer.response()["status"], "ok")
+        self.assertTrue(health_writer.response()["activation_held"])
+        self.assertTrue(health_writer.response()["held"])
+
+        self.hold_path.unlink()
+        for _ in range(100):
+            if not list(inbox.glob("*.json")):
+                break
+            await asyncio.sleep(0.01)
+        restarted.shutdown_event.set()
+        await restarted_watcher
+        self.assertEqual(restarted.executor.execute.call_count, 2)
+        self.assertEqual(list(inbox.glob("*.json")), [])
+        self.assertEqual(len(list((self.relay_root / "archive").glob("*.json"))), 2)
+
+    async def test_disabled_auto_file_is_not_archived_or_replied_to(self):
+        inbox = self.relay_root / "inbox-test"
+        message = self._auto_message("disabled policy task")
+        path = relay.write_message_file_atomic(inbox, "dawn", message)
+        before = path.read_bytes()
+        daemon = self._daemon(enabled=False)
+
+        self.assertFalse(await daemon._process_file_message(path))
+
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse((self.relay_root / "archive" / path.name).exists())
+        daemon.executor.execute.assert_not_called()
+        daemon.executor._send_result_back.assert_not_called()
+        self.assertNotIn(message["msg_id"], daemon.dedup.seen)
+
+    def test_hmac_verification_preserves_signed_payload(self):
+        message = self._auto_message("immutable signature")
+        before = json.loads(json.dumps(message))
+
+        self.assertTrue(relay.verify_message(message, self.secret))
+
+        self.assertEqual(message, before)
 
 
 class AutoExecutorModelInvariantTests(unittest.TestCase):

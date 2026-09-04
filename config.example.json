@@ -21,6 +21,7 @@
   "socket_path": "/tmp/relay.sock",
   "auto_execute": {
     "enabled": true,
+    "activation_hold_sentinel": "~/.relay/activation.hold",
     "max_concurrent": 2,
     "timeout": 300,
     "canonical_wire_ready": false,

@@ -44,6 +44,7 @@ VERSION = "2.1.0"
 DEFAULT_PORT = 7272
 MAX_MESSAGE_SIZE = 1_048_576  # 1 MB
 HMAC_MAX_AGE = 300.0  # 5 minutes
+FILE_HMAC_MAX_AGE = 7 * 86400.0  # held/offline fallback may wait across quota windows
 RATE_LIMIT = 10  # connections per second per IP
 FILE_POLL_INTERVAL = 5  # seconds
 DEDUP_TTL = 3600.0  # 1 hour
@@ -356,6 +357,9 @@ class Config:
         ae = self.data.get("auto_execute", {})
         self.model_policy_events = []
         self.auto_execute_enabled = ae.get("enabled", True)
+        self.activation_hold_path = Path(self._expand(
+            ae.get("activation_hold_sentinel", "~/.relay/activation.hold")
+        ))
         self.canonical_wire_ready = ae.get("canonical_wire_ready", False) is True
         self.max_concurrent = ae.get("max_concurrent", 2)
         self.exec_timeout = ae.get("timeout", EXECUTION_TIMEOUT)
@@ -463,6 +467,16 @@ class Config:
     def get_peer_ip(self, target):
         return self.peers.get(target, {}).get("ip")
 
+    def activation_held(self):
+        """Return the live release hold state; filesystem ambiguity fails closed."""
+        try:
+            os.lstat(self.activation_hold_path)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+
     def get_peer_ssh_user(self, target):
         return self.peers.get(target, {}).get("ssh_user")
 
@@ -524,16 +538,22 @@ def sign_message(payload, secret):
 
 
 def verify_message(message, secret, max_age=HMAC_MAX_AGE):
-    """Verify HMAC signature and timestamp freshness."""
-    signature = message.pop("signature", None)
+    """Verify HMAC signature and timestamp freshness without mutating input."""
+    if not isinstance(message, dict):
+        return False
+
+    unsigned = message.copy()
+    signature = unsigned.pop("signature", None)
     if not signature:
         return False
 
-    ts = message.get("timestamp", 0)
+    ts = unsigned.get("timestamp", 0)
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return False
     if abs(time.time() - ts) > max_age:
         return False
 
-    canonical = json.dumps(message, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"))
     expected = hmac.new(
         secret.encode("utf-8"),
         canonical.encode("utf-8"),
@@ -541,6 +561,14 @@ def verify_message(message, secret, max_age=HMAC_MAX_AGE):
     ).hexdigest()
 
     return hmac.compare_digest(signature, expected)
+
+
+def is_auto_message(message):
+    """Return whether a relay message requests unattended execution."""
+    tags = message.get("tags", [])
+    return bool(message.get("auto_execute", False)) or (
+        isinstance(tags, (list, tuple, set)) and "AUTO" in tags
+    )
 
 
 # ── Message Framing ──
@@ -566,6 +594,62 @@ def frame_and_encode(msg_dict):
     return frame_message(payload)
 
 
+def file_message_bytes(message):
+    """Return the stable on-disk representation for a relay message."""
+    return json.dumps(message, indent=2).encode("utf-8")
+
+
+def file_message_name(machine, message):
+    """Return a collision-resistant, retry-stable inbox filename."""
+    payload = file_message_bytes(message)
+    digest = hashlib.sha256(payload).hexdigest()
+    timestamp = message.get("timestamp", time.time())
+    try:
+        stamp = datetime.fromtimestamp(float(timestamp)).strftime("%Y%m%d-%H%M%S-%f")
+    except (OSError, OverflowError, TypeError, ValueError):
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    safe_machine = re.sub(r"[^A-Za-z0-9_.-]", "_", str(machine))[:64] or "unknown"
+    return f"{stamp}-{safe_machine}-{digest}.json"
+
+
+def write_message_file_atomic(inbox_path, machine, message):
+    """Durably publish one complete message without exposing a partial file."""
+    inbox_path.mkdir(parents=True, exist_ok=True)
+    payload = file_message_bytes(message)
+    filepath = inbox_path / file_message_name(machine, message)
+
+    if filepath.exists():
+        if filepath.read_bytes() != payload:
+            raise OSError(f"Inbox filename collision: {filepath.name}")
+        return filepath
+
+    tmp_path = inbox_path / f".{filepath.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp_path), str(filepath))
+        try:
+            dir_fd = os.open(str(inbox_path), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Some network filesystems do not support directory fsync. The
+            # atomic file replacement still prevents partial JSON visibility.
+            pass
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    return filepath
+
+
 # ── Deduplication ──
 
 class DeduplicationFilter:
@@ -579,6 +663,10 @@ class DeduplicationFilter:
             return True
         self.seen[msg_id] = time.time()
         return False
+
+    def forget(self, msg_id):
+        """Allow a deliberately deferred message to be retried later."""
+        self.seen.pop(msg_id, None)
 
     def _expire(self):
         cutoff = time.time() - self.ttl
@@ -897,6 +985,16 @@ class RelayDaemon:
         self.start_time = time.time()
         self.stats = {"tcp_received": 0, "tcp_sent": 0, "file_received": 0, "file_sent": 0}
 
+    def _activation_held(self):
+        """Read the live hold sentinel, failing closed for incomplete test configs."""
+        checker = getattr(self.config, "activation_held", None)
+        if checker is None:
+            return True
+        try:
+            return bool(checker())
+        except OSError:
+            return True
+
     def _setup_logging(self):
         logger = logging.getLogger("relay")
         logger.setLevel(logging.INFO)
@@ -937,11 +1035,14 @@ class RelayDaemon:
 
             # Ping: no auth required
             if msg_type == "ping":
+                held = self._activation_held()
                 resp = {
                     "type": "pong",
                     "machine": self.config.machine,
                     "uptime": time.time() - self.start_time,
                     "version": VERSION,
+                    "activation_held": held,
+                    "held": held,
                     "stats": self.stats,
                 }
                 writer.write(frame_and_encode(resp))
@@ -963,6 +1064,48 @@ class RelayDaemon:
                 await writer.wait_closed()
                 return
 
+            # A release hold is an application-level execution barrier. ACK an
+            # AUTO request only after its complete signed payload is durable in
+            # the local inbox. Do not add it to volatile dedup state: the file
+            # must remain eligible when the hold is deliberately removed.
+            if is_auto_message(message) and self._activation_held():
+                inbox = self.config.get_my_file_inbox()
+                try:
+                    if inbox is None:
+                        raise OSError("No local file inbox available")
+                    queued_path = self._write_file_message(inbox, message)
+                except OSError as exc:
+                    self.logger.error(
+                        "Activation hold could not queue AUTO message from %s: %s",
+                        peer_ip,
+                        exc,
+                    )
+                    resp = {
+                        "status": "error",
+                        "error": "activation hold queue unavailable",
+                        "activation_held": True,
+                        "held": True,
+                        "msg_id": message.get("msg_id", ""),
+                    }
+                else:
+                    self.stats["tcp_received"] += 1
+                    self.logger.info(
+                        "Activation hold queued AUTO message: %s",
+                        queued_path.name,
+                    )
+                    resp = {
+                        "status": "ok",
+                        "note": "queued_activation_hold",
+                        "activation_held": True,
+                        "held": True,
+                        "msg_id": message.get("msg_id", ""),
+                    }
+                writer.write(frame_and_encode(resp))
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+
             # Deduplication
             msg_id = message.get("msg_id", "")
             if self.dedup.is_duplicate(msg_id):
@@ -974,7 +1117,12 @@ class RelayDaemon:
                 return
 
             # ACK immediately
-            resp = {"status": "ok", "msg_id": msg_id}
+            resp = {
+                "status": "ok",
+                "msg_id": msg_id,
+                "activation_held": False,
+                "held": False,
+            }
             writer.write(frame_and_encode(resp))
             await writer.drain()
             writer.close()
@@ -983,7 +1131,7 @@ class RelayDaemon:
             self.stats["tcp_received"] += 1
 
             # Process the message
-            await self._process_message(message)
+            await self._process_message(message, source="tcp")
 
         except (asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
             self.logger.warning(f"Connection error from {peer_ip}: {e}")
@@ -998,19 +1146,45 @@ class RelayDaemon:
             except Exception:
                 pass
 
-    async def _process_message(self, message):
-        """Route a received message: display, auto-execute, or store."""
+    async def _process_message(self, message, source="tcp"):
+        """Route a message and report whether a source file may be archived."""
         sender = message.get("from", "unknown")
         body = message.get("body", message.get("message", "(empty)"))
-        auto = message.get("auto_execute", False)
-        tags = message.get("tags", [])
+        auto = is_auto_message(message)
 
-        if auto or "AUTO" in tags:
+        if auto:
+            if self._activation_held():
+                self.logger.info(
+                    "Activation hold deferred AUTO message from %s (%s)",
+                    sender,
+                    source,
+                )
+                if source != "file":
+                    inbox = self.config.get_my_file_inbox()
+                    if inbox is None:
+                        self.logger.error(
+                            "Activation hold has no local inbox for AUTO message"
+                        )
+                        return False
+                    try:
+                        self._write_file_message(inbox, message)
+                    except OSError as exc:
+                        self.logger.error(
+                            "Activation hold failed to queue AUTO message: %s", exc
+                        )
+                        return False
+                    self.dedup.forget(message.get("msg_id", ""))
+                return False
             if not self.config.auto_execute_enabled:
                 self.logger.warning(
                     "AUTO-EXEC refused: auto-execution is disabled (sender=%s)",
                     sender,
                 )
+                # A fallback file is a durable pending request, not a completed
+                # refusal. Leave it exactly where it is so a future intentional
+                # policy change/restart can reconsider it without data loss.
+                if source == "file":
+                    return False
                 if message.get("reply_to"):
                     await asyncio.to_thread(
                         self.executor._send_result_back,
@@ -1018,18 +1192,29 @@ class RelayDaemon:
                         "Relay auto-execution is disabled by receiver policy",
                         False,
                     )
-                return
+                return True
             if self.executor.can_accept():
                 self.executor.execute(message)
+                return True
             else:
                 self.logger.warning(f"Max concurrent executions reached, queuing: {body[:80]}")
-                # Write to file inbox for later processing
+                # An existing file already is the durable queue entry. A TCP
+                # request needs one written before it can be considered safe.
+                if source == "file":
+                    return False
                 inbox = self.config.get_my_file_inbox()
                 if inbox:
-                    self._write_file_message(inbox, message)
+                    try:
+                        self._write_file_message(inbox, message)
+                    except OSError as exc:
+                        self.logger.error("Failed to queue busy AUTO message: %s", exc)
+                        return False
+                    return True
+                return False
         else:
             play_alert(self.config.platform)
             self.logger.info(f"Message from {sender}: {body[:200]}")
+            return True
 
     # ── Unix Socket Server (local CLI IPC) ──
 
@@ -1040,11 +1225,14 @@ class RelayDaemon:
             cmd = request.get("cmd", "")
 
             if cmd == "health":
+                held = self._activation_held()
                 resp = {
                     "status": "ok",
                     "machine": self.config.machine,
                     "uptime": time.time() - self.start_time,
                     "version": VERSION,
+                    "activation_held": held,
+                    "held": held,
                     "tailscale_ip": self.config.tailscale_ip,
                     "port": self.config.port,
                     "stats": self.stats,
@@ -1112,7 +1300,14 @@ class RelayDaemon:
             if resp.get("status") == "ok":
                 self.stats["tcp_sent"] += 1
                 self.logger.info(f"Sent to {target} via TCP")
-                return {"method": "tcp", "msg_id": message.get("msg_id")}
+                return {
+                    "method": "tcp",
+                    "msg_id": message.get("msg_id"),
+                    "activation_held": bool(
+                        resp.get("activation_held", resp.get("held", False))
+                    ),
+                    "note": resp.get("note"),
+                }
 
         except (ConnectionRefusedError, asyncio.TimeoutError, OSError) as e:
             self.logger.info(f"TCP to {target} failed ({e}), falling back to file")
@@ -1132,12 +1327,8 @@ class RelayDaemon:
         return {"method": "error", "error": "No delivery method available"}
 
     def _write_file_message(self, inbox_path, message):
-        """Write a message to a file-based inbox."""
-        inbox_path.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = f"{ts}-{self.config.machine}.json"
-        filepath = inbox_path / filename
-        filepath.write_text(json.dumps(message, indent=2))
+        """Atomically write a complete message to a file-based inbox."""
+        return write_message_file_atomic(inbox_path, self.config.machine, message)
 
     def _ssh_deliver(self, target, local_inbox, message):
         """Try SSH/scp delivery as additional file transport."""
@@ -1152,11 +1343,10 @@ class RelayDaemon:
             return
 
         remote_inbox = f"{remote_base}/inbox-{target}"
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = f"{ts}-{self.config.machine}.json"
+        filename = file_message_name(self.config.machine, message)
 
         # Write temp file
-        tmp = Path(f"/tmp/relay-{filename}")
+        tmp = Path(f"/tmp/relay-{uuid.uuid4().hex}-{filename}")
         tmp.write_text(json.dumps(message, indent=2))
 
         try:
@@ -1181,58 +1371,74 @@ class RelayDaemon:
         """Poll file-based inbox for fallback messages."""
         seen = set()
 
-        # On startup, note existing files
+        # Existing files are intentionally processed on startup unless a live
+        # activation hold is present. While held, do not even mark filenames as
+        # seen: they must become eligible after release, including after restart.
         inbox = self.config.get_my_file_inbox()
-        if inbox and inbox.exists():
-            for f in inbox.glob("*.json"):
-                seen.add(f.name)
-            # Process any existing messages
+        if inbox and inbox.exists() and not self._activation_held():
             for f in sorted(inbox.glob("*.json")):
-                await self._process_file_message(f)
-                seen.add(f.name)
+                if await self._process_file_message(f):
+                    seen.add(f.name)
 
         while not self.shutdown_event.is_set():
             try:
                 await asyncio.sleep(FILE_POLL_INTERVAL)
+                if self._activation_held():
+                    continue
                 inbox = self.config.get_my_file_inbox()
                 if not inbox or not inbox.exists():
                     continue
 
                 for msg_path in sorted(inbox.glob("*.json")):
                     if msg_path.name not in seen:
-                        seen.add(msg_path.name)
-                        await self._process_file_message(msg_path)
+                        if await self._process_file_message(msg_path):
+                            seen.add(msg_path.name)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.logger.error(f"File watcher error: {e}")
 
     async def _process_file_message(self, msg_path):
-        """Process a file-based message."""
+        """Process a file message; return true only when it is terminal."""
+        if self._activation_held():
+            return False
+
         try:
             msg = json.loads(msg_path.read_text())
 
             # HMAC is mandatory when a secret is configured
             if self.config.secret:
-                if not verify_message(msg, self.config.secret):
+                if not verify_message(
+                    msg,
+                    self.config.secret,
+                    max_age=FILE_HMAC_MAX_AGE,
+                ):
                     self.logger.warning(f"HMAC failed/missing on file message: {msg_path.name}")
-                    return
+                    return True
 
             # Dedup
             msg_id = msg.get("msg_id", msg_path.name)
             if self.dedup.is_duplicate(msg_id):
                 # Archive duplicate silently
                 self._archive_file(msg_path)
-                return
+                return True
 
-            self.stats["file_received"] += 1
-            await self._process_message(msg)
+            terminal = await self._process_message(msg, source="file")
+            if not terminal:
+                self.dedup.forget(msg_id)
+                return False
 
             # Archive processed message
+            if self._activation_held():
+                self.dedup.forget(msg_id)
+                return False
             self._archive_file(msg_path)
+            self.stats["file_received"] += 1
+            return True
 
         except (json.JSONDecodeError, OSError) as e:
             self.logger.warning(f"Error reading file message {msg_path.name}: {e}")
+            return True
 
     def _archive_file(self, msg_path):
         """Move processed message to archive."""
@@ -1241,11 +1447,11 @@ class RelayDaemon:
             archive.mkdir(parents=True, exist_ok=True)
             try:
                 msg_path.rename(archive / msg_path.name)
-            except OSError:
-                try:
-                    msg_path.unlink()
-                except OSError:
-                    pass
+            except OSError as exc:
+                # Never turn an archive failure into message deletion.
+                self.logger.warning(
+                    "Failed to archive file message %s: %s", msg_path.name, exc
+                )
 
     # ── Status & Query Methods ──
 
@@ -1265,6 +1471,14 @@ class RelayDaemon:
         return {"messages": len(messages), "senders": senders}
 
     def _read_file_inbox(self):
+        if self._activation_held():
+            return {
+                "messages": [],
+                "archived": 0,
+                "activation_held": True,
+                "held": True,
+            }
+
         inbox = self.config.get_my_file_inbox()
         archive = self.config.get_archive_dir()
         if not inbox or not inbox.exists():
@@ -1283,6 +1497,7 @@ class RelayDaemon:
         return {"messages": result, "archived": len(result)}
 
     def _get_status(self):
+        held = self._activation_held()
         inbox = self.config.get_my_file_inbox()
         inbox_count = len(list(inbox.glob("*.json"))) if inbox and inbox.exists() else 0
 
@@ -1300,6 +1515,8 @@ class RelayDaemon:
             "port": self.config.port,
             "uptime": time.time() - self.start_time,
             "version": VERSION,
+            "activation_held": held,
+            "held": held,
             "transport": "tcp+file",
             "inbox": inbox_count,
             "outbox": outbox_counts,
@@ -1479,10 +1696,11 @@ def _direct_send(target, message):
     # File fallback
     inbox = config.get_file_inbox(target)
     if inbox:
-        inbox.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = f"{ts}-{config.machine}.json"
-        (inbox / filename).write_text(json.dumps(message, indent=2))
+        try:
+            write_message_file_atomic(inbox, config.machine, message)
+        except OSError as exc:
+            print(f"Error: file delivery failed for {target}: {exc}")
+            return
         print(f"Sent to {target} via file (direct, daemon down)")
     else:
         print(f"Error: no delivery method available for {target}")
@@ -1552,6 +1770,7 @@ def cli_health(socket_path):
         h, rem = divmod(int(uptime), 3600)
         m, s = divmod(rem, 60)
         print(f"Uptime: {h}h {m}m {s}s")
+        print(f"Activation hold: {'ON' if resp.get('activation_held') else 'off'}")
         stats = resp.get("stats", {})
         print(f"Stats: TCP rx={stats.get('tcp_received', 0)} tx={stats.get('tcp_sent', 0)} | File rx={stats.get('file_received', 0)} tx={stats.get('file_sent', 0)}")
     else:
@@ -1586,6 +1805,7 @@ def cli_ping(socket_path, target):
             h, rem = divmod(int(uptime), 3600)
             m, s = divmod(rem, 60)
             print(f"  uptime: {h}h {m}m {s}s")
+            print(f"  activation hold: {'ON' if resp.get('activation_held') else 'off'}")
         else:
             print(f"Unexpected response: {resp}")
     except ConnectionRefusedError:
@@ -1618,6 +1838,9 @@ def cli_check(socket_path):
 def cli_read(socket_path):
     resp = _uds_request(socket_path, {"cmd": "read"})
     if resp:
+        if resp.get("activation_held"):
+            print("Activation hold is ON; inbox files were left untouched.")
+            return
         messages = resp.get("messages", [])
         if not messages:
             print("No unread messages.")
@@ -1638,6 +1861,9 @@ def cli_read(socket_path):
     else:
         print("Daemon not running. Reading files directly...")
         config = Config()
+        if config.activation_held():
+            print("Activation hold is ON; inbox files were left untouched.")
+            return
         inbox = config.get_my_file_inbox()
         archive = config.get_archive_dir()
         if not inbox or not inbox.exists():
@@ -1672,6 +1898,7 @@ def cli_status(socket_path):
         print(f"Machine: {resp.get('machine')} (v{resp.get('version', '?')})")
         print(f"Transport: {resp.get('transport')}")
         print(f"Tailscale: {resp.get('tailscale_ip')}:{resp.get('port')}")
+        print(f"Activation hold: {'ON' if resp.get('activation_held') else 'off'}")
         print()
         print(f"Inbox: {resp.get('inbox', 0)} unread")
         for target, count in resp.get("outbox", {}).items():
@@ -1684,6 +1911,7 @@ def cli_status(socket_path):
         config = Config()
         print(f"Machine: {config.machine} (daemon NOT running)")
         print(f"Transport: file-only (daemon offline)")
+        print(f"Activation hold: {'ON' if config.activation_held() else 'off'}")
         root = config._get_file_root()
         if root:
             print(f"Relay root: {root}")

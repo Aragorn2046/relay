@@ -107,6 +107,18 @@ The Claude capability probe treats `--effort` as required and fails closed when
 it is unavailable; the settings overlay is defense in depth, not a substitute
 for the explicit native `ultracode` effort argument.
 
+## Activation hold
+
+Creating the configured `activation_hold_sentinel` (default
+`~/.relay/activation.hold`) leaves health, ping, status, and ordinary relay
+traffic available while fail-closing unattended execution. Signed TCP AUTO
+requests are acknowledged only after an atomic durable write to the local file
+inbox. Every file inbox entry remains untouched while the sentinel exists,
+including across daemon restarts; removing the sentinel releases eligible
+entries to the normal receiver policy. An explicit `auto_execute.enabled=false`
+also leaves queued AUTO files unarchived. Health, ping, and status responses
+report `held=true` while the barrier is active.
+
 ## Tests
 
 ```bash
