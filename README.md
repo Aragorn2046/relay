@@ -13,6 +13,12 @@ TCP-primary message relay for cross-machine communication over Tailscale.
 
 ## Setup
 
+Requirements: Python 3.9+ and a Claude Code CLI for which
+`python3 relay.py probe-claude` reports `"ok": true`. The capability probe makes
+no model request and spends no tokens. This release was validated against
+Claude Code 2.1.260; capability presence, rather than the version string alone,
+is the release gate.
+
 1. Generate a shared secret and distribute to all machines:
    ```bash
    python3 -c "import secrets; print(secrets.token_hex(32))" > ~/.relay-secret
@@ -42,6 +48,53 @@ relay.py ping <target>                 Health-check a peer
 relay.py health                        Local daemon status
 relay.py status                        Full system status
 relay.py history                       Recent archived messages
+relay.py probe-claude                  Check installed Claude CLI flags without a model call
+```
+
+## Model policy and compatibility
+
+Relay auto-execution accepts exactly two canonical models:
+
+| Role | Canonical model |
+|---|---|
+| Primary | `claude-fable-5-1` |
+| Only fallback and subagent model | `claude-opus-5` |
+
+Legacy names are accepted at the receiver and audited when normalized. Fable,
+Sonnet, and Haiku aliases map to Fable 5.1; old Opus aliases map to Opus 5.
+This includes dated vendor IDs such as `claude-3-5-sonnet-20240620` and
+`claude-3-opus-20240229`. Unknown families are rejected and, when `reply_to` is
+present, the sender receives a failure result.
+
+During the compatibility window the CLI validates model names locally but
+preserves the caller's original model value on the wire. A legacy configured
+default likewise remains a legacy wire value while execution is canonicalized
+inside the receiver. Deploy receiver-first:
+
+1. Deploy the new `relay.py` to every receiving daemon while leaving existing
+   `auto_execute` model settings unchanged.
+2. Run `python3 relay.py probe-claude` on each host and restart each daemon only
+   after the probe passes.
+3. Verify old aliases are accepted by every upgraded receiver.
+4. Only then migrate each config to the canonical names shown above.
+
+Rollback is the reverse compatibility operation: pause new auto-execution,
+drain queued messages while upgraded receivers can still normalize both name
+formats, restore legacy config names, then roll back senders and receivers.
+Never revert a receiver while canonical-model messages remain queued for it.
+
+An explicitly narrower `allowed_models` list remains narrower after upgrade.
+Unsupported entries are dropped with an audit warning; the full canonical pair
+is used only when the setting is absent or has no supported entries. A
+Fable-only allowlist also suppresses automatic Opus fallback. The subagent
+model remains Opus 5 as a separate fleetwide invariant.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m py_compile relay.py tests/test_model_invariant.py
+python3 relay.py probe-claude
 ```
 
 ## Service Management

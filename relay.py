@@ -13,6 +13,7 @@ Usage (CLI):
     relay.py history                          Show recent archived messages
     relay.py ping <target>                    Health-check a remote daemon
     relay.py health                           Local daemon health
+    relay.py probe-claude                     Verify Claude CLI flags without a model call
 
 Usage (daemon):
     relay.py daemon                           Start the relay daemon
@@ -24,6 +25,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -51,6 +53,14 @@ EXECUTION_TIMEOUT = 300  # 5 minutes
 PRIMARY_MODEL = "claude-fable-5-1"
 FALLBACK_MODEL = "claude-opus-5"
 ALLOWED_MODELS = (PRIMARY_MODEL, FALLBACK_MODEL)
+CLAUDE_REQUIRED_FLAGS = (
+    "--model",
+    "--settings",
+    "--max-budget-usd",
+    "--print",
+)
+CLAUDE_OPTIONAL_FLAGS = ("--effort", "--fallback-model")
+ULTRACODE_SETTINGS = '{"ultracode":true,"effortLevel":"xhigh"}'
 
 
 def normalize_model(model):
@@ -68,15 +78,149 @@ def normalize_model(model):
         return normalized
 
     parts = normalized.split("-")
-    if parts and parts[0] == "claude":
+    claude_qualified = bool(parts and parts[0] == "claude")
+    if claude_qualified:
         parts = parts[1:]
-    family = parts[0] if parts else ""
+
+    families = {part for part in parts if part in {"fable", "sonnet", "haiku", "opus"}}
+    if len(families) != 1:
+        return None
+    family = next(iter(families))
+
+    # Bare aliases must start with the family. Vendor IDs may put a dated
+    # generation before it, for example claude-3-5-sonnet-20240620.
+    if not claude_qualified and (not parts or parts[0] != family):
+        return None
 
     if family in {"fable", "sonnet", "haiku"}:
         return PRIMARY_MODEL
     if family == "opus":
         return FALLBACK_MODEL
     return None
+
+
+def build_claude_environment():
+    """Build the isolated environment used for Claude CLI subprocesses."""
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
+    env["CLAUDE_CODE_SUBAGENT_MODEL"] = FALLBACK_MODEL
+
+    # Daemons spawned outside an interactive shell don't inherit fnm/Homebrew
+    # PATH entries, so `claude` isn't resolvable. Prepend common locations on
+    # both WSL and macOS.
+    home = Path.home()
+    extra_path = ":".join(str(path) for path in [
+        home / ".local/share/fnm/aliases/default/bin",
+        home / ".local/bin",
+        home / ".bun/bin",
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ])
+    env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
+    return env, extra_path
+
+
+def probe_claude_capabilities(claude_bin, env):
+    """Inspect the installed CLI without making a model request or spending tokens."""
+    # Subagent mode intentionally presents a reduced plain-help surface. Probe
+    # the complete option catalog first, then run the parser smoke with the
+    # actual execution environment (including the forced Opus 5 subagent).
+    help_env = env.copy()
+    help_env.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
+    version_result = None
+    try:
+        version_result = subprocess.run(
+            [claude_bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=help_env,
+        )
+    except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
+        # Version text is evidence only; do not take working execution offline
+        # when that optional probe is unavailable.
+        pass
+
+    def detected_flags(text):
+        return [
+            flag for flag in (*CLAUDE_REQUIRED_FLAGS, *CLAUDE_OPTIONAL_FLAGS)
+            if re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", text)
+        ]
+
+    # Some Bun-packaged Claude builds intermittently truncate piped --help
+    # output while still exiting zero. Union several no-spend attempts, also
+    # tolerating a transient timeout, before declaring a capability absent.
+    help_results = []
+    help_errors = []
+    help_text = ""
+    supported = []
+    missing_required = list(CLAUDE_REQUIRED_FLAGS)
+    for _ in range(4):
+        try:
+            help_result = subprocess.run(
+                [claude_bin, "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=help_env,
+            )
+        except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired) as exc:
+            help_errors.append(f"{type(exc).__name__}: {exc}")
+            continue
+        help_results.append(help_result)
+        help_text += f"\n{help_result.stdout or ''}\n{help_result.stderr or ''}"
+        supported = detected_flags(help_text)
+        missing_required = [flag for flag in CLAUDE_REQUIRED_FLAGS if flag not in supported]
+        if not missing_required:
+            break
+
+    missing_optional = [flag for flag in CLAUDE_OPTIONAL_FLAGS if flag not in supported]
+    version_text = ""
+    if version_result is not None:
+        version_text = (version_result.stdout or version_result.stderr or "").strip()
+    version = version_text.splitlines()[0] if version_text else "unknown"
+    errors = []
+    if not help_results or not any(result.returncode == 0 for result in help_results):
+        detail = help_errors[-1] if help_errors else "non-zero exits"
+        errors.append(f"all help probes failed: {detail}")
+    if missing_required:
+        errors.append(f"missing required flags: {', '.join(missing_required)}")
+
+    parser_smoke_ok = False
+    if not errors:
+        smoke_cmd = [
+            claude_bin,
+            "--model", PRIMARY_MODEL,
+            "--settings", ULTRACODE_SETTINGS,
+        ]
+        if "--effort" not in missing_optional:
+            smoke_cmd.extend(["--effort", "xhigh"])
+        if "--fallback-model" not in missing_optional:
+            smoke_cmd.extend(["--fallback-model", FALLBACK_MODEL])
+        smoke_cmd.extend(["--max-budget-usd", "0.01", "--print", "--help"])
+        try:
+            smoke_result = subprocess.run(
+                smoke_cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env,
+            )
+            parser_smoke_ok = smoke_result.returncode == 0
+            if not parser_smoke_ok:
+                errors.append(f"flag parser smoke exited {smoke_result.returncode}")
+        except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"flag parser smoke failed: {type(exc).__name__}: {exc}")
+
+    return {
+        "ok": not errors,
+        "version": version,
+        "parser_smoke_ok": parser_smoke_ok,
+        "supported_flags": supported,
+        "missing_required": missing_required,
+        "missing_optional": missing_optional,
+        "error": "; ".join(errors) if errors else None,
+    }
 
 # ── Machine Detection ──
 
@@ -182,15 +326,71 @@ class Config:
 
         # Auto-execution config
         ae = self.data.get("auto_execute", {})
+        self.model_policy_events = []
         self.auto_execute_enabled = ae.get("enabled", True)
         self.max_concurrent = ae.get("max_concurrent", 2)
         self.exec_timeout = ae.get("timeout", EXECUTION_TIMEOUT)
-        self.default_model = normalize_model(ae.get("default_model", PRIMARY_MODEL)) or PRIMARY_MODEL
+        raw_default_model = ae.get("default_model", PRIMARY_MODEL)
+        normalized_default = normalize_model(raw_default_model)
+        if normalized_default is None:
+            normalized_default = PRIMARY_MODEL
+            self.model_policy_events.append((
+                "warning",
+                f"Configured default model {raw_default_model!r} is unsupported; using {PRIMARY_MODEL}",
+            ))
+        elif raw_default_model != normalized_default:
+            self.model_policy_events.append((
+                "info",
+                f"Configured default model normalized: {raw_default_model!r} -> {normalized_default}",
+            ))
         self.default_budget = ae.get("default_budget", 1.0)
         self.max_budget = ae.get("max_budget", 5.0)
-        # This is a fleet invariant rather than a configurable expansion point:
-        # stale configs may name legacy aliases, but no third model may execute.
-        self.allowed_models = list(ALLOWED_MODELS)
+
+        raw_allowed_models = ae.get("allowed_models")
+        normalized_allowed = []
+        if raw_allowed_models is not None:
+            candidates = raw_allowed_models if isinstance(raw_allowed_models, list) else [raw_allowed_models]
+            for candidate in candidates:
+                normalized = normalize_model(candidate)
+                if normalized is None:
+                    self.model_policy_events.append((
+                        "warning",
+                        f"Configured allowed model {candidate!r} was dropped as unsupported",
+                    ))
+                    continue
+                if candidate != normalized:
+                    self.model_policy_events.append((
+                        "info",
+                        f"Configured allowed model normalized: {candidate!r} -> {normalized}",
+                    ))
+                if normalized not in normalized_allowed:
+                    normalized_allowed.append(normalized)
+
+        # Preserve a deliberate narrower allowlist. Only absent or wholly
+        # invalid/empty configuration receives the canonical full pair.
+        self.allowed_models = normalized_allowed or list(ALLOWED_MODELS)
+        if raw_allowed_models is not None and not normalized_allowed:
+            self.model_policy_events.append((
+                "warning",
+                "Configured allowed_models had no supported entries; using the canonical model pair",
+            ))
+
+        if normalized_default not in self.allowed_models:
+            replacement = next(
+                (model for model in ALLOWED_MODELS if model in self.allowed_models),
+                self.allowed_models[0],
+            )
+            self.model_policy_events.append((
+                "warning",
+                f"Configured default model {normalized_default} is outside allowed_models; using {replacement}",
+            ))
+            normalized_default = replacement
+        self.default_model = normalized_default
+        self.wire_default_model = (
+            raw_default_model
+            if normalize_model(raw_default_model) == self.default_model
+            else self.default_model
+        )
 
         # Secret
         secret_file = self._expand(self.data.get("secret_file", "~/.relay-secret"))
@@ -434,6 +634,45 @@ class AutoExecutor:
         self.logger = logger
         self.active = 0
         self.lock = threading.Lock()
+        self.capability_lock = threading.Lock()
+        self.capability_cache = {}
+
+    def _get_claude_capabilities(self, claude_bin, env):
+        """Probe once per installed binary revision and emit a safe audit line."""
+        try:
+            stat = Path(claude_bin).stat()
+            cache_key = (claude_bin, stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            cache_key = (claude_bin, None, None)
+
+        with self.capability_lock:
+            cached = self.capability_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+            report = probe_claude_capabilities(claude_bin, env)
+            self.capability_cache = {cache_key: report}
+            if report["ok"]:
+                self.logger.info(
+                    "Claude CLI capability probe passed: version=%s flags=%s",
+                    report["version"],
+                    ",".join(report["supported_flags"]),
+                )
+            else:
+                self.logger.error(
+                    "Claude CLI capability probe failed: version=%s error=%s",
+                    report["version"],
+                    report["error"],
+                )
+            if "--effort" in report["missing_optional"]:
+                self.logger.warning(
+                    "Claude CLI lacks --effort; using effortLevel=xhigh in the settings overlay"
+                )
+            if "--fallback-model" in report["missing_optional"]:
+                self.logger.warning(
+                    "Claude CLI lacks --fallback-model; automatic fallback is disabled rather than substituting another model"
+                )
+            return report
 
     def can_accept(self):
         with self.lock:
@@ -452,11 +691,51 @@ class AutoExecutor:
         requested_model = msg.get("model", self.config.default_model)
         model = normalize_model(requested_model)
         if model not in self.config.allowed_models:
-            self.logger.warning(f"AUTO-EXEC rejected: invalid model '{requested_model}' from {msg.get('from', 'unknown')}")
+            self.logger.warning(
+                "AUTO-EXEC rejected: invalid model %r from %s",
+                requested_model,
+                msg.get("from", "unknown"),
+            )
+            if msg.get("reply_to"):
+                self._send_result_back(
+                    msg,
+                    f"Unsupported or disallowed relay model: {requested_model!r}",
+                    False,
+                )
             with self.lock:
                 self.active -= 1
             return
         sender = msg.get("from", "unknown")
+        if requested_model != model:
+            self.logger.info(
+                "AUTO-EXEC model normalized from %r to %s for sender %s",
+                requested_model,
+                model,
+                sender,
+            )
+
+        env, extra_path = build_claude_environment()
+        home = Path.home()
+        claude_bin = shutil.which("claude", path=env["PATH"])
+        if not claude_bin:
+            result = f"CLAUDE BINARY NOT FOUND: looked in {extra_path}"
+            self.logger.error("AUTO-EXEC PATH failure: %s", result)
+            self._log_to_vault(task, result, False, 0, model, budget)
+            if msg.get("reply_to"):
+                self._send_result_back(msg, result, False)
+            with self.lock:
+                self.active -= 1
+            return
+
+        capabilities = self._get_claude_capabilities(claude_bin, env)
+        if not capabilities["ok"]:
+            result = f"CLAUDE CLI CAPABILITY CHECK FAILED: {capabilities['error']}"
+            self._log_to_vault(task, result, False, 0, model, budget)
+            if msg.get("reply_to"):
+                self._send_result_back(msg, result, False)
+            with self.lock:
+                self.active -= 1
+            return
 
         self.logger.info(f"AUTO-EXEC from {sender}: {task[:120]} (model={model}, budget=${budget})")
         play_exec_alert(self.config.platform)
@@ -465,37 +744,21 @@ class AutoExecutor:
         success = False
         result = ""
 
-        env = os.environ.copy()
-        env.pop("CLAUDECODE", None)
-        env["CLAUDE_CODE_SUBAGENT_MODEL"] = FALLBACK_MODEL
-        # Daemons spawned outside an interactive shell don't inherit fnm/Homebrew
-        # PATH entries, so `claude` isn't resolvable. Prepend the common install
-        # locations so subprocess can find the binary on both WSL and macOS.
-        home = Path.home()
-        extra_path = ":".join(str(p) for p in [
-            home / ".local/share/fnm/aliases/default/bin",
-            home / ".local/bin",
-            home / ".bun/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-        ])
-        env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
-        claude_bin = shutil.which("claude", path=env["PATH"])
-
         try:
-            if not claude_bin:
-                raise FileNotFoundError(
-                    f"'claude' binary not on PATH. Looked in: {extra_path}"
-                )
             cmd = [
                 claude_bin,
                 "--model", model,
-                "--effort", "xhigh",
-                "--settings", '{"ultracode":true}',
+                "--settings", ULTRACODE_SETTINGS,
             ]
-            if model == PRIMARY_MODEL:
+            if "--effort" not in capabilities["missing_optional"]:
+                cmd.extend(["--effort", "xhigh"])
+            if (
+                model == PRIMARY_MODEL
+                and FALLBACK_MODEL in self.config.allowed_models
+                and "--fallback-model" not in capabilities["missing_optional"]
+            ):
                 cmd.extend(["--fallback-model", FALLBACK_MODEL])
-            cmd.extend(["--max-budget-usd", str(budget), "-p", task])
+            cmd.extend(["--max-budget-usd", str(budget), "--print", task])
             cwd = str(home / "workspace")
             if not Path(cwd).exists():
                 cwd = str(home)
@@ -571,6 +834,8 @@ class RelayDaemon:
     def __init__(self, config):
         self.config = config
         self.logger = self._setup_logging()
+        for level, message in getattr(self.config, "model_policy_events", []):
+            getattr(self.logger, level)("MODEL POLICY: %s", message)
         self.dedup = DeduplicationFilter()
         self.rate_limiter = RateLimiter()
         self.executor = AutoExecutor(config, self.logger)
@@ -1081,11 +1346,13 @@ def cli_send_via_daemon(
     }
     if auto:
         requested_model = model
-        model = normalize_model(requested_model)
-        if model is None:
+        validated_model = normalize_model(requested_model)
+        if validated_model is None:
             raise ValueError(f"Unsupported model: {requested_model}")
         message["budget"] = budget
-        message["model"] = model
+        # Compatibility window: validate locally, but preserve the caller's
+        # wire value until every receiver has shipped normalization support.
+        message["model"] = requested_model
         message["reply_to"] = machine_name
         message["tags"] = ["AUTO"]
 
@@ -1146,6 +1413,33 @@ def _direct_send(target, message):
         print(f"Sent to {target} via file (direct, daemon down)")
     else:
         print(f"Error: no delivery method available for {target}")
+
+
+def cli_probe_claude():
+    """Print a secret-free installed-CLI capability report; never calls a model."""
+    env, searched_path = build_claude_environment()
+    claude_bin = shutil.which("claude", path=env["PATH"])
+    if not claude_bin:
+        report = {
+            "ok": False,
+            "binary": None,
+            "version": "unavailable",
+            "parser_smoke_ok": False,
+            "supported_flags": [],
+            "missing_required": list(CLAUDE_REQUIRED_FLAGS),
+            "missing_optional": list(CLAUDE_OPTIONAL_FLAGS),
+            "error": f"claude binary not found in {searched_path}",
+            "model_request_made": False,
+        }
+    else:
+        report = probe_claude_capabilities(claude_bin, env)
+        report = {
+            **report,
+            "binary": claude_bin,
+            "model_request_made": False,
+        }
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return report["ok"]
 
 
 def _uds_request(socket_path, request, timeout=10.0):
@@ -1386,7 +1680,7 @@ def main():
         args = args[1:]
         auto = False
         budget = config.default_budget
-        model = config.default_model
+        model = config.wire_default_model
         msg_parts = []
         i = 0
         while i < len(args):
@@ -1440,6 +1734,10 @@ def main():
 
     elif command == "health":
         cli_health(socket_path)
+
+    elif command == "probe-claude":
+        if not cli_probe_claude():
+            sys.exit(2)
 
     else:
         print(f"Unknown command: {command}")
