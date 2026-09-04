@@ -32,10 +32,17 @@ class ModelNormalizationTests(unittest.TestCase):
     def test_legacy_fable_sonnet_and_haiku_upgrade_to_fable_5_1(self):
         aliases = (
             "fable",
+            "fable-5",
+            "fable-5.1",
             "claude-fable-5",
             "sonnet",
+            "sonnet-4-6",
+            "claude-sonnet-4-6",
+            "sonnet-5",
             "claude-sonnet-5",
             "haiku",
+            "haiku-4-5",
+            "claude-haiku-4-5",
             "claude-haiku-4-5-20251001",
             "anthropic:claude-sonnet-5",
             "anthropic/claude-sonnet-5",
@@ -50,6 +57,10 @@ class ModelNormalizationTests(unittest.TestCase):
         aliases = (
             "opus",
             "claude-opus-4-1",
+            "opus-4-7",
+            "claude-opus-4-7",
+            "opus-4-8",
+            "claude-opus-4-8",
             "anthropic:claude-opus-4",
             "anthropic/claude-opus-4",
             "claude-3-opus-20240229",

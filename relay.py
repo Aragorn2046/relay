@@ -72,10 +72,17 @@ ULTRACODE_SETTINGS = '{"ultracode":true}'
 MODEL_ALIASES = {
     PRIMARY_MODEL: PRIMARY_MODEL,
     "fable": PRIMARY_MODEL,
+    "fable-5": PRIMARY_MODEL,
+    "fable-5.1": PRIMARY_MODEL,
     "claude-fable-5": PRIMARY_MODEL,
     "sonnet": PRIMARY_MODEL,
+    "sonnet-4-6": PRIMARY_MODEL,
+    "claude-sonnet-4-6": PRIMARY_MODEL,
+    "sonnet-5": PRIMARY_MODEL,
     "claude-sonnet-5": PRIMARY_MODEL,
     "haiku": PRIMARY_MODEL,
+    "haiku-4-5": PRIMARY_MODEL,
+    "claude-haiku-4-5": PRIMARY_MODEL,
     "claude-haiku-4-5-20251001": PRIMARY_MODEL,
     "claude-3-5-sonnet-20240620": PRIMARY_MODEL,
     "claude-3-7-sonnet-latest": PRIMARY_MODEL,
@@ -83,6 +90,10 @@ MODEL_ALIASES = {
     "opus": FALLBACK_MODEL,
     "claude-opus-4": FALLBACK_MODEL,
     "claude-opus-4-1": FALLBACK_MODEL,
+    "opus-4-7": FALLBACK_MODEL,
+    "claude-opus-4-7": FALLBACK_MODEL,
+    "opus-4-8": FALLBACK_MODEL,
+    "claude-opus-4-8": FALLBACK_MODEL,
     "claude-3-opus-20240229": FALLBACK_MODEL,
 }
 
