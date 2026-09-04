@@ -199,18 +199,28 @@ def probe_claude_capabilities(claude_bin, env):
         ]
         if "--fallback-model" not in missing_optional:
             smoke_cmd.extend(["--fallback-model", FALLBACK_MODEL])
-        smoke_cmd.extend(["--max-budget-usd", "0.01", "--print", "--help"])
+        smoke_cmd.extend(["--max-budget-usd", "0.01", "--print"])
         try:
             smoke_result = subprocess.run(
                 smoke_cmd,
                 capture_output=True,
                 text=True,
+                input="",
                 timeout=10,
                 env=env,
             )
-            parser_smoke_ok = smoke_result.returncode == 0
+            smoke_text = f"{smoke_result.stdout or ''}\n{smoke_result.stderr or ''}".lower()
+            # `ultracode` is a supported hidden alias in Claude 2.1.260 even
+            # though the public --help choices stop at max. An empty print-mode
+            # invocation validates the real value parser and must stop at the
+            # local no-input boundary, before any model request can be made.
+            parser_smoke_ok = (
+                smoke_result.returncode != 0
+                and "input must be provided" in smoke_text
+                and "unknown --effort value" not in smoke_text
+            )
             if not parser_smoke_ok:
-                errors.append(f"flag parser smoke exited {smoke_result.returncode}")
+                errors.append("native ultracode parser smoke did not reach the no-input boundary")
         except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired) as exc:
             errors.append(f"flag parser smoke failed: {type(exc).__name__}: {exc}")
 

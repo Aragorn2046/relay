@@ -180,12 +180,14 @@ class ConfigModelInvariantTests(unittest.TestCase):
 
 
 class ClaudeCapabilityProbeTests(unittest.TestCase):
-    def test_probe_uses_only_local_version_and_help_commands(self):
+    def test_probe_uses_only_no_spend_local_commands(self):
         help_text = " ".join((*relay.CLAUDE_REQUIRED_FLAGS, *relay.CLAUDE_OPTIONAL_FLAGS))
         results = [
             subprocess.CompletedProcess([], 0, stdout="2.1.260 (Claude Code)\n", stderr=""),
             subprocess.CompletedProcess([], 0, stdout=help_text, stderr=""),
-            subprocess.CompletedProcess([], 0, stdout=help_text, stderr=""),
+            subprocess.CompletedProcess(
+                [], 1, stdout="", stderr="Error: Input must be provided",
+            ),
         ]
 
         with mock.patch.object(relay.subprocess, "run", side_effect=results) as run:
@@ -212,7 +214,8 @@ class ClaudeCapabilityProbeTests(unittest.TestCase):
             run.call_args_list[2].kwargs["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
             relay.FALLBACK_MODEL,
         )
-        self.assertEqual(smoke_cmd[-1], "--help")
+        self.assertEqual(smoke_cmd[-1], "--print")
+        self.assertEqual(run.call_args_list[2].kwargs["input"], "")
         self.assertEqual(
             smoke_cmd[smoke_cmd.index("--effort") + 1],
             relay.ULTRACODE_EFFORT,
@@ -232,7 +235,9 @@ class ClaudeCapabilityProbeTests(unittest.TestCase):
                 stdout=" ".join(relay.CLAUDE_REQUIRED_FLAGS),
                 stderr="",
             ),
-            subprocess.CompletedProcess([], 0, stdout="help", stderr=""),
+            subprocess.CompletedProcess(
+                [], 1, stdout="", stderr="Error: Input must be provided",
+            ),
         ]
 
         with mock.patch.object(relay.subprocess, "run", side_effect=results) as run:
@@ -291,7 +296,9 @@ class ClaudeCapabilityProbeTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, stdout="test-version", stderr=""),
             subprocess.TimeoutExpired(["/test/claude", "--help"], 10),
             subprocess.CompletedProcess([], 0, stdout=help_text, stderr=""),
-            subprocess.CompletedProcess([], 0, stdout=help_text, stderr=""),
+            subprocess.CompletedProcess(
+                [], 1, stdout="", stderr="Error: Input must be provided",
+            ),
         ]
 
         with mock.patch.object(relay.subprocess, "run", side_effect=results):
@@ -299,6 +306,33 @@ class ClaudeCapabilityProbeTests(unittest.TestCase):
 
         self.assertTrue(report["ok"])
         self.assertTrue(report["parser_smoke_ok"])
+
+    def test_unknown_ultracode_value_fails_before_execution(self):
+        help_text = " ".join(
+            (*relay.CLAUDE_REQUIRED_FLAGS, *relay.CLAUDE_OPTIONAL_FLAGS)
+        )
+        results = [
+            subprocess.CompletedProcess([], 0, stdout="test-version", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=help_text, stderr=""),
+            subprocess.CompletedProcess(
+                [],
+                1,
+                stdout="",
+                stderr=(
+                    "Warning: Unknown --effort value 'ultracode' - ignoring it. "
+                    "Error: Input must be provided"
+                ),
+            ),
+        ]
+
+        with mock.patch.object(relay.subprocess, "run", side_effect=results):
+            report = relay.probe_claude_capabilities(
+                "/test/claude", {"PATH": "/test"},
+            )
+
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["parser_smoke_ok"])
+        self.assertIn("native ultracode parser smoke", report["error"])
 
     def test_subagent_model_is_forced_to_opus_5(self):
         with mock.patch.dict(
