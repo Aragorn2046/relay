@@ -6,7 +6,9 @@ Unified daemon + CLI. Replaces the old file-based relay.py + relay-watcher.py.
 Usage (CLI):
     relay.py send <target> "message"          Send a message
     relay.py send <target> --auto "task"      Send for auto-execution
-    relay.py send <target> --auto --budget 2.0 --model opus "task"
+    relay.py send <target> --auto --budget 2.0 --model <alias> "task"
+                                              (no --model: the Model Routing
+                                              registry picks, policy background-claude)
     relay.py check                            Check for unread messages
     relay.py read                             Read and archive unread messages
     relay.py status                           Show relay system status
@@ -34,7 +36,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -48,6 +50,16 @@ DEDUP_TTL = 3600.0  # 1 hour
 TCP_CONNECT_TIMEOUT = 2.0
 TCP_READ_TIMEOUT = 5.0
 EXECUTION_TIMEOUT = 300  # 5 minutes
+
+# ── Model routing ──
+# An AUTO-EXEC message that names no model runs on the Model Routing registry's
+# background-claude policy, resolved per run by Config/scripts/session-route.py.
+# The compiled model below runs ONLY when that route cannot be read, and every
+# such run is logged loudly (stderr, daemon log, ~/.shelby/routing-fallback.jsonl).
+ROUTE_CONSUMER = "background-claude"
+ROUTE_FALLBACK_MODEL = "claude-sonnet-5"  # routing-fallback
+ROUTING_FALLBACK_LOG = Path.home() / ".shelby" / "routing-fallback.jsonl"
+ROUTE_TIMEOUT = 5.0
 
 # ── Machine Detection ──
 
@@ -156,7 +168,8 @@ class Config:
         self.auto_execute_enabled = ae.get("enabled", True)
         self.max_concurrent = ae.get("max_concurrent", 2)
         self.exec_timeout = ae.get("timeout", EXECUTION_TIMEOUT)
-        self.default_model = ae.get("default_model", "sonnet")
+        # auto_execute.default_model is no longer read: an unnamed model is
+        # resolved from the Model Routing registry (see resolve_background_route).
         self.default_budget = ae.get("default_budget", 1.0)
         self.max_budget = ae.get("max_budget", 5.0)
         self.allowed_models = ae.get("allowed_models", ["sonnet", "opus", "haiku"])
@@ -397,6 +410,95 @@ def play_done_alert(platform):
 
 # ── Auto-Execution ──
 
+class RouteRefused(Exception):
+    """The registry answered, but with a route these runs must not launch."""
+
+
+def _session_route_helper():
+    override = os.environ.get("SHELBY_SESSION_ROUTE")
+    if override:
+        return override
+    home = Path.home()
+    for candidate in (home / "42" / "Config" / "scripts" / "session-route.py",
+                      home / "vault" / "Config" / "scripts" / "session-route.py"):
+        if candidate.exists():
+            return str(candidate)
+    return str(home / "42" / "Config" / "scripts" / "session-route.py")
+
+
+def _log_route_fallback(logger, reason, chain):
+    """Loud trail for every compiled-fallback run: stderr, daemon log, jsonl."""
+    host = socket.gethostname().split(".")[0].lower()
+    line = f"WARNING: {ROUTE_CONSUMER}: registry route unavailable ({reason}); running compiled fallback {ROUTE_FALLBACK_MODEL}"
+    print(line, file=sys.stderr, flush=True)
+    if logger:
+        logger.warning(line)
+    record = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "consumer": ROUTE_CONSUMER,
+              "host": host, "reason": reason, "chain": chain}
+    try:
+        ROUTING_FALLBACK_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with ROUTING_FALLBACK_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        print(f"WARNING: could not append {ROUTING_FALLBACK_LOG}: {exc}", file=sys.stderr, flush=True)
+
+
+def resolve_background_route(logger=None, timeout=ROUTE_TIMEOUT):
+    """Return {model, effort, fallback_model, source} for an unnamed-model run.
+
+    Raises RouteRefused when the registry answered with a route that must not
+    run (helper exit 3). Any other failure runs the compiled fallback, loudly.
+    """
+    helper = _session_route_helper()
+    reason = None
+    payload = None
+    try:
+        proc = subprocess.run(
+            [sys.executable, helper, "--consumer", ROUTE_CONSUMER, "--json", "--timeout", str(timeout)],
+            capture_output=True, text=True, timeout=timeout + 10, check=False,
+        )
+        try:
+            payload = json.loads(proc.stdout)
+        except (ValueError, TypeError):
+            payload = None
+        if proc.returncode == 3 and isinstance(payload, dict):
+            raise RouteRefused(payload.get("reason") or "registry refused the route")
+        if proc.returncode != 0 or not isinstance(payload, dict):
+            first = (proc.stderr or "").strip().splitlines()[:1]
+            reason = f"session-route exit {proc.returncode}" + (f": {first[0][:200]}" if first else "")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        reason = f"session-route unavailable: {type(exc).__name__}: {exc}"
+
+    if reason is None:
+        if payload.get("route_source") == "default":
+            reason = "session-route returned its compiled default (registry unreadable)"
+        elif payload.get("kind") != "claude" or not isinstance(payload.get("model"), str):
+            raise RouteRefused(f"route is not a Claude model: {payload.get('model')!r}")
+
+    if reason is not None:
+        _log_route_fallback(logger, reason, [ROUTE_FALLBACK_MODEL])
+        return {"model": ROUTE_FALLBACK_MODEL, "effort": None, "fallback_model": None,
+                "source": "compiled-fallback"}
+
+    fallback_model = None
+    for item in payload.get("fallbacks") or []:
+        if isinstance(item, dict) and item.get("kind") == "claude" and isinstance(item.get("model"), str):
+            fallback_model = item["model"]  # claude -p takes one overload fallback
+            break
+    return {"model": payload["model"], "effort": payload.get("effort") or None,
+            "fallback_model": fallback_model,
+            "source": f"registry rev {payload.get('revision')} ({payload.get('route_source')})"}
+
+
+def build_claude_cmd(claude_bin, model, budget, task, effort=None, fallback_model=None):
+    cmd = [claude_bin, "--model", model]
+    if effort:
+        cmd += ["--effort", effort]
+    if fallback_model and fallback_model != model:
+        cmd += ["--fallback-model", fallback_model]
+    return cmd + ["--max-budget-usd", str(budget), "-p", task]
+
+
 class AutoExecutor:
     def __init__(self, config, logger):
         self.config = config
@@ -418,15 +520,37 @@ class AutoExecutor:
     def _run(self, msg):
         task = msg.get("body", msg.get("message", ""))
         budget = min(float(msg.get("budget", self.config.default_budget)), self.config.max_budget)
-        model = msg.get("model", self.config.default_model)
-        if model not in self.config.allowed_models:
-            self.logger.warning(f"AUTO-EXEC rejected: invalid model '{model}' from {msg.get('from', 'unknown')}")
-            with self.lock:
-                self.active -= 1
-            return
+        explicit_model = msg.get("model")
+        effort = None
+        fallback_model = None
+        if explicit_model:
+            # A message that names a model is a manual override of the registry.
+            model = explicit_model
+            if model not in self.config.allowed_models:
+                self.logger.warning(f"AUTO-EXEC rejected: invalid model '{model}' from {msg.get('from', 'unknown')}")
+                with self.lock:
+                    self.active -= 1
+                return
+            route_note = "message override"
+        else:
+            try:
+                route = resolve_background_route(self.logger)
+            except RouteRefused as exc:
+                reason = f"REFUSED: the Model Routing registry route for {ROUTE_CONSUMER} cannot run: {exc}"
+                self.logger.error(f"AUTO-EXEC {reason} (task: {task[:80]})")
+                print(f"ERROR: {reason}", file=sys.stderr, flush=True)
+                self._log_to_vault(task, reason, False, 0.0, "(refused)", budget)
+                if msg.get("reply_to"):
+                    self._send_result_back(msg, reason, False)
+                with self.lock:
+                    self.active -= 1
+                return
+            model, effort, fallback_model = route["model"], route["effort"], route["fallback_model"]
+            route_note = route["source"]
         sender = msg.get("from", "unknown")
 
-        self.logger.info(f"AUTO-EXEC from {sender}: {task[:120]} (model={model}, budget=${budget})")
+        self.logger.info(f"AUTO-EXEC from {sender}: {task[:120]} (model={model}, effort={effort or '-'}, "
+                         f"route={route_note}, budget=${budget})")
         play_exec_alert(self.config.platform)
 
         start = time.time()
@@ -454,7 +578,7 @@ class AutoExecutor:
                 raise FileNotFoundError(
                     f"'claude' binary not on PATH. Looked in: {extra_path}"
                 )
-            cmd = [claude_bin, "--model", model, "--max-budget-usd", str(budget), "-p", task]
+            cmd = build_claude_cmd(claude_bin, model, budget, task, effort, fallback_model)
             cwd = str(home / "workspace")
             if not Path(cwd).exists():
                 cwd = str(home)
@@ -1021,7 +1145,7 @@ class RelayDaemon:
 
 # ── CLI Client ──
 
-def cli_send_via_daemon(socket_path, target, body, machine_name, auto=False, budget=1.0, model="sonnet"):
+def cli_send_via_daemon(socket_path, target, body, machine_name, auto=False, budget=1.0, model=None):
     """Send a message through the local daemon."""
     message = {
         "from": machine_name,
@@ -1032,7 +1156,8 @@ def cli_send_via_daemon(socket_path, target, body, machine_name, auto=False, bud
     }
     if auto:
         message["budget"] = budget
-        message["model"] = model
+        if model:  # no model = the receiver resolves it from the registry
+            message["model"] = model
         message["reply_to"] = machine_name
         message["tags"] = ["AUTO"]
 
@@ -1045,7 +1170,7 @@ def cli_send_via_daemon(socket_path, target, body, machine_name, auto=False, bud
         if method == "error":
             print(f"Error: {delivery.get('error')}")
         else:
-            mode = f" [AUTO, ${budget}, {model}]" if auto else ""
+            mode = f" [AUTO, ${budget}, {model or 'registry route'}]" if auto else ""
             print(f"Message sent to {target}{mode} via {method}")
     else:
         # Daemon not running — direct send
@@ -1333,7 +1458,7 @@ def main():
         args = args[1:]
         auto = False
         budget = config.default_budget
-        model = config.default_model
+        model = None
         msg_parts = []
         i = 0
         while i < len(args):
