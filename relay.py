@@ -460,9 +460,14 @@ def resolve_background_route(logger=None, timeout=ROUTE_TIMEOUT):
     fallbacks = payload.get("fallbacks") or []
     if not isinstance(fallbacks, list):
         raise RouteRefused("session-route answered with a malformed fallback list")
-    rows = [(payload.get("model"), payload.get("effort"))] if payload.get("kind") == "claude" else []
-    rows += [(item.get("model"), item.get("effort")) for item in fallbacks
-             if isinstance(item, dict) and item.get("kind") == "claude"]
+    if payload.get("route_source") not in ("live", "cache", "default"):
+        raise RouteRefused(f"session-route answered with an unknown route source {payload.get('route_source')!r}")
+    answer = [payload] + [item for item in fallbacks if isinstance(item, dict)]
+    rows = [(item.get("model"), item.get("effort")) for item in answer if item.get("kind") == "claude"]
+    skipped = [f"{item.get('kind')}:{item.get('model')}" for item in answer if item.get("kind") != "claude"]
+    if skipped and logger is not None:
+        logger.info(f"AUTO-EXEC route: {ROUTE_CONSUMER} rows this runtime cannot launch (not Claude), "
+                    f"skipped as the card documents: {', '.join(skipped)}")
     # Non-Claude rows are skipped (documented on the card). A Claude row that
     # is not launchable (not a claude-* id, or a level the CLI rejects) is
     # route damage: refuse rather than quietly run a later row.
@@ -481,7 +486,9 @@ def resolve_background_route(logger=None, timeout=ROUTE_TIMEOUT):
 def pick_route_row(route, requested_model=None):
     """(model, effort, fallback_model) for this run. A message may name a model
     only if that model is one of the card's own Claude rows (it then runs at
-    that row's effort); the card's next row is the CLI's overload fallback."""
+    that row's effort). The overload fallback is the next LATER row with another
+    model (never a wrap back to an earlier row), and only when that row has the
+    same level: the CLI takes one --effort for the whole run."""
     rows = route["rows"]
     index = 0
     if requested_model and requested_model.strip().lower() in _LEGACY_DEFAULT_ALIASES:
@@ -495,8 +502,8 @@ def pick_route_row(route, requested_model=None):
                                f"({', '.join(m for m, _ in rows)})")
         index = matches[0]
     model, effort = rows[index]
-    rest = [m for m, _ in rows[index + 1:] + rows[:index] if m != model]
-    return model, effort, (rest[0] if rest else None)
+    later = [(m, e) for m, e in rows[index + 1:] if m != model]
+    return model, effort, (later[0][0] if later and later[0][1] == effort else None)
 
 
 def build_claude_cmd(claude_bin, model, budget, task, effort=None, fallback_model=None):

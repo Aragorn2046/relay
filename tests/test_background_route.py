@@ -70,13 +70,33 @@ class BackgroundRouteTests(_RouteCase):
         with self.helper(self.LIVE):
             route = relay.resolve_background_route(self.logger)
         self.assertEqual(route["rows"], [("claude-opus-5-5", "high"), ("claude-sonnet-5", "low")])
+        # The next row runs at another level, so the CLI cannot use it as the fallback.
+        self.assertEqual(relay.pick_route_row(route), ("claude-opus-5-5", "high", None))
+
+    def test_the_fallback_is_the_next_later_row_at_the_same_level_never_a_wrap(self):
+        route = {"rows": [("claude-opus-5-5", "high"), ("claude-sonnet-5", "high"), ("claude-opus-5", "high")],
+                 "source": "x"}
         self.assertEqual(relay.pick_route_row(route), ("claude-opus-5-5", "high", "claude-sonnet-5"))
+        self.assertEqual(relay.pick_route_row(route, "claude-sonnet-5"), ("claude-sonnet-5", "high", "claude-opus-5"))
+        self.assertEqual(relay.pick_route_row(route, "claude-opus-5"), ("claude-opus-5", "high", None))
+        route = {"rows": [("claude-opus-5-5", "high"), ("claude-opus-5-5", "low"), ("claude-sonnet-5", "high")],
+                 "source": "x"}
+        self.assertEqual(relay.pick_route_row(route), ("claude-opus-5-5", "high", "claude-sonnet-5"))
+
+    def test_an_unknown_route_source_refuses_and_skipped_rows_are_logged(self):
+        with self.helper(dict(self.LIVE, route_source="override")):
+            with self.assertRaises(relay.RouteRefused):
+                relay.resolve_background_route(self.logger)
+        logger = mock.Mock()
+        with self.helper(self.LIVE):
+            relay.resolve_background_route(logger)
+        self.assertIn("codex:gpt-6-astra", logger.info.call_args[0][0])
 
     def test_a_named_model_must_be_a_row_and_runs_at_that_rows_effort(self):
         with self.helper(self.LIVE):
             route = relay.resolve_background_route(self.logger)
         self.assertEqual(relay.pick_route_row(route, "claude-sonnet-5"),
-                         ("claude-sonnet-5", "low", "claude-opus-5-5"))
+                         ("claude-sonnet-5", "low", None))
         for bad in ("claude-fable-5-1", "gpt-6-astra", "claude-opus-5"):
             with self.subTest(bad=bad), self.assertRaises(relay.RouteRefused):
                 relay.pick_route_row(route, bad)
@@ -124,7 +144,7 @@ class BackgroundRouteTests(_RouteCase):
 
     def test_a_legacy_default_alias_is_no_choice(self):
         route = {"rows": [("claude-opus-5-5", "high"), ("claude-sonnet-5", "low")], "source": "x"}
-        self.assertEqual(relay.pick_route_row(route, "sonnet"), ("claude-opus-5-5", "high", "claude-sonnet-5"))
+        self.assertEqual(relay.pick_route_row(route, "sonnet"), ("claude-opus-5-5", "high", None))
 
     def test_build_claude_cmd(self):
         self.assertEqual(relay.build_claude_cmd("claude", "claude-sonnet-5", 1.0, "t"),
