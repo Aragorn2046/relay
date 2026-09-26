@@ -61,6 +61,8 @@ EXECUTION_TIMEOUT = 300  # 5 minutes
 ROUTE_CONSUMER = "background-claude"
 ROUTE_TIMEOUT = 15.0
 _CLAUDE_LEVELS = ("", "low", "medium", "high", "xhigh", "max")
+# Bare aliases older relays put on every AUTO message (their old default).
+_LEGACY_DEFAULT_ALIASES = frozenset({"sonnet", "opus", "haiku"})
 
 # ── Machine Detection ──
 
@@ -461,10 +463,13 @@ def resolve_background_route(logger=None, timeout=ROUTE_TIMEOUT):
     rows = [(payload.get("model"), payload.get("effort"))] if payload.get("kind") == "claude" else []
     rows += [(item.get("model"), item.get("effort")) for item in fallbacks
              if isinstance(item, dict) and item.get("kind") == "claude"]
-    # Same launchability rule as the Dusk watchers: a claude-* id and a level
-    # the claude CLI accepts (or none = the CLI default).
-    rows = [(m, e or None) for m, e in rows
-            if isinstance(m, str) and re.fullmatch(r"claude-[a-z0-9.-]+", m) and (e or "") in _CLAUDE_LEVELS]
+    # Non-Claude rows are skipped (documented on the card). A Claude row that
+    # is not launchable (not a claude-* id, or a level the CLI rejects) is
+    # route damage: refuse rather than quietly run a later row.
+    for m, e in rows:
+        if not (isinstance(m, str) and re.fullmatch(r"claude-[a-z0-9.-]+", m) and (e or "") in _CLAUDE_LEVELS):
+            raise RouteRefused(f"the {ROUTE_CONSUMER} card has an unlaunchable Claude row ({m!r} at {e!r})")
+    rows = [(m, e or None) for m, e in rows]
     if not rows:
         raise RouteRefused(f"the {ROUTE_CONSUMER} card has no Claude row")
     source = ("compiled default (registry unreadable, logged by session-route)"
@@ -479,6 +484,10 @@ def pick_route_row(route, requested_model=None):
     that row's effort); the card's next row is the CLI's overload fallback."""
     rows = route["rows"]
     index = 0
+    if requested_model and requested_model.strip().lower() in _LEGACY_DEFAULT_ALIASES:
+        # An older sender stamps its old default alias on every AUTO message:
+        # that is no choice at all, so the card's own order applies.
+        requested_model = None
     if requested_model:
         matches = [i for i, (model, _) in enumerate(rows) if model == requested_model]
         if not matches:
@@ -532,13 +541,17 @@ class AutoExecutor:
                 raise RouteRefused(f"route could not be read: {type(exc).__name__}: {exc}") from exc
         except RouteRefused as exc:
             reason = f"REFUSED: the Model Routing registry route for {ROUTE_CONSUMER} cannot run: {exc}"
-            self.logger.error(f"AUTO-EXEC {reason} (task: {task[:80]})")
-            print(f"ERROR: {reason}", file=sys.stderr, flush=True)
-            self._log_to_vault(task, reason, False, 0.0, "(refused)", budget)
-            if msg.get("reply_to"):
-                self._send_result_back(msg, reason, False)
-            with self.lock:
-                self.active -= 1
+            try:
+                self.logger.error(f"AUTO-EXEC {reason} (task: {task[:80]})")
+                print(f"ERROR: {reason}", file=sys.stderr, flush=True)
+                self._log_to_vault(task, reason, False, 0.0, "(refused)", budget)
+                if msg.get("reply_to"):
+                    self._send_result_back(msg, reason, False)
+            except Exception as log_exc:  # never leak the concurrency slot
+                self.logger.error(f"AUTO-EXEC refusal could not be reported: {log_exc}")
+            finally:
+                with self.lock:
+                    self.active -= 1
             return
         route_note = route["source"] + (f", message chose row {model}" if explicit_model else "")
         sender = msg.get("from", "unknown")

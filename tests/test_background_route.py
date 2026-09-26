@@ -77,7 +77,7 @@ class BackgroundRouteTests(_RouteCase):
             route = relay.resolve_background_route(self.logger)
         self.assertEqual(relay.pick_route_row(route, "claude-sonnet-5"),
                          ("claude-sonnet-5", "low", "claude-opus-5-5"))
-        for bad in ("opus", "sonnet", "claude-fable-5-1", "gpt-6-astra"):
+        for bad in ("claude-fable-5-1", "gpt-6-astra", "claude-opus-5"):
             with self.subTest(bad=bad), self.assertRaises(relay.RouteRefused):
                 relay.pick_route_row(route, bad)
 
@@ -115,6 +115,16 @@ class BackgroundRouteTests(_RouteCase):
                           "fallbacks": 7}):
             with self.assertRaises(relay.RouteRefused):
                 relay.resolve_background_route(self.logger)
+
+    def test_an_unlaunchable_claude_row_refuses_instead_of_running_a_later_row(self):
+        with self.helper({"kind": "claude", "model": "sonnet", "effort": None, "route_source": "live",
+                          "fallbacks": [{"kind": "claude", "model": "claude-sonnet-5", "effort": "low"}]}):
+            with self.assertRaises(relay.RouteRefused):
+                relay.resolve_background_route(self.logger)
+
+    def test_a_legacy_default_alias_is_no_choice(self):
+        route = {"rows": [("claude-opus-5-5", "high"), ("claude-sonnet-5", "low")], "source": "x"}
+        self.assertEqual(relay.pick_route_row(route, "sonnet"), ("claude-opus-5-5", "high", "claude-sonnet-5"))
 
     def test_build_claude_cmd(self):
         self.assertEqual(relay.build_claude_cmd("claude", "claude-sonnet-5", 1.0, "t"),
@@ -156,7 +166,7 @@ class AutoExecutorModelTests(_RouteCase):
     def test_a_named_model_outside_the_card_is_refused(self):
         with self.helper({"kind": "claude", "model": "claude-sonnet-5", "effort": None, "revision": 74,
                           "route_source": "live", "fallbacks": []}):
-            argv = self.run_message({"body": "hello", "from": "dawn", "model": "opus"})
+            argv = self.run_message({"body": "hello", "from": "dawn", "model": "claude-fable-5-1"})
         self.assertIsNone(argv)
 
     def test_a_named_model_never_beats_a_paused_card(self):
@@ -168,6 +178,12 @@ class AutoExecutorModelTests(_RouteCase):
         with mock.patch.object(relay, "resolve_background_route", side_effect=TypeError("boom")):
             argv = self.run_message({"body": "hello", "from": "dawn"})
         self.assertIsNone(argv)  # run_message asserts active went back to 0
+
+    def test_a_failing_refusal_report_never_leaks_the_slot(self):
+        with self.helper({"reason": "paused"}, exit_code=3), \
+             mock.patch.object(relay.AutoExecutor, "_log_to_vault", side_effect=OSError("disk")):
+            argv = self.run_message({"body": "hello", "from": "dawn"})
+        self.assertIsNone(argv)  # run_message asserts active returned to 0
 
     def test_refused_route_never_launches_claude(self):
         with self.helper({"reason": "resolver answer cannot be honoured: x"}, exit_code=3):
