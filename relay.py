@@ -487,8 +487,8 @@ def pick_route_row(route, requested_model=None):
     """(model, effort, fallback_model) for this run. A message may name a model
     only if that model is one of the card's own Claude rows (it then runs at
     that row's effort). The overload fallback is the next LATER row with another
-    model (never a wrap back to an earlier row), and only when that row has the
-    same level: the CLI takes one --effort for the whole run."""
+    model at the same level (never a wrap back to an earlier row; rows at
+    another level are skipped): the CLI takes one --effort for the whole run."""
     rows = route["rows"]
     index = 0
     if requested_model and requested_model.strip().lower() in _LEGACY_DEFAULT_ALIASES:
@@ -502,8 +502,10 @@ def pick_route_row(route, requested_model=None):
                                f"({', '.join(m for m, _ in rows)})")
         index = matches[0]
     model, effort = rows[index]
-    later = [(m, e) for m, e in rows[index + 1:] if m != model]
-    return model, effort, (later[0][0] if later and later[0][1] == effort else None)
+    # The first LATER row with another model at this row's level (rows at
+    # another level are skipped, never used, never a wrap to an earlier row).
+    later = [m for m, e in rows[index + 1:] if m != model and e == effort]
+    return model, effort, (later[0] if later else None)
 
 
 def build_claude_cmd(claude_bin, model, budget, task, effort=None, fallback_model=None):

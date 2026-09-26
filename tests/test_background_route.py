@@ -83,6 +83,11 @@ class BackgroundRouteTests(_RouteCase):
                  "source": "x"}
         self.assertEqual(relay.pick_route_row(route), ("claude-opus-5-5", "high", "claude-sonnet-5"))
 
+    def test_a_different_level_row_is_skipped_for_a_later_same_level_one(self):
+        route = {"rows": [("claude-opus-5-5", "high"), ("claude-sonnet-5", "low"), ("claude-opus-5", "high")],
+                 "source": "x"}
+        self.assertEqual(relay.pick_route_row(route), ("claude-opus-5-5", "high", "claude-opus-5"))
+
     def test_an_unknown_route_source_refuses_and_skipped_rows_are_logged(self):
         with self.helper(dict(self.LIVE, route_source="override")):
             with self.assertRaises(relay.RouteRefused):
