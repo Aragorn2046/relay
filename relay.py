@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import logging
 import os
 import shutil
@@ -59,6 +60,7 @@ EXECUTION_TIMEOUT = 300  # 5 minutes
 # when session-route itself fails, the run is refused, never guessed.
 ROUTE_CONSUMER = "background-claude"
 ROUTE_TIMEOUT = 15.0
+_CLAUDE_LEVELS = ("", "low", "medium", "high", "xhigh", "max")
 
 # ── Machine Detection ──
 
@@ -453,10 +455,16 @@ def resolve_background_route(logger=None, timeout=ROUTE_TIMEOUT):
         raise RouteRefused(f"session-route exit {proc.returncode}" + (f": {first[0][:200]}" if first else ""))
     if proc.returncode != 0:
         raise RouteRefused(payload.get("reason") or f"session-route exit {proc.returncode}")
+    fallbacks = payload.get("fallbacks") or []
+    if not isinstance(fallbacks, list):
+        raise RouteRefused("session-route answered with a malformed fallback list")
     rows = [(payload.get("model"), payload.get("effort"))] if payload.get("kind") == "claude" else []
-    rows += [(item.get("model"), item.get("effort")) for item in payload.get("fallbacks") or []
+    rows += [(item.get("model"), item.get("effort")) for item in fallbacks
              if isinstance(item, dict) and item.get("kind") == "claude"]
-    rows = [(m, e or None) for m, e in rows if isinstance(m, str) and m]
+    # Same launchability rule as the Dusk watchers: a claude-* id and a level
+    # the claude CLI accepts (or none = the CLI default).
+    rows = [(m, e or None) for m, e in rows
+            if isinstance(m, str) and re.fullmatch(r"claude-[a-z0-9.-]+", m) and (e or "") in _CLAUDE_LEVELS]
     if not rows:
         raise RouteRefused(f"the {ROUTE_CONSUMER} card has no Claude row")
     source = ("compiled default (registry unreadable, logged by session-route)"
@@ -515,8 +523,13 @@ class AutoExecutor:
         explicit_model = msg.get("model")
         # The registry always decides; a message may only pick one of the card's rows.
         try:
-            route = resolve_background_route(self.logger)
-            model, effort, fallback_model = pick_route_row(route, explicit_model)
+            try:
+                route = resolve_background_route(self.logger)
+                model, effort, fallback_model = pick_route_row(route, explicit_model)
+            except RouteRefused:
+                raise
+            except Exception as exc:  # never wedge auto-exec on an unexpected answer
+                raise RouteRefused(f"route could not be read: {type(exc).__name__}: {exc}") from exc
         except RouteRefused as exc:
             reason = f"REFUSED: the Model Routing registry route for {ROUTE_CONSUMER} cannot run: {exc}"
             self.logger.error(f"AUTO-EXEC {reason} (task: {task[:80]})")

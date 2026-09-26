@@ -106,6 +106,16 @@ class BackgroundRouteTests(_RouteCase):
             with self.assertRaises(relay.RouteRefused):
                 relay.resolve_background_route(self.logger)
 
+    def test_unlaunchable_rows_and_malformed_answers_refuse(self):
+        with self.helper({"kind": "claude", "model": "sonnet", "effort": "ultracode", "route_source": "live",
+                          "fallbacks": []}):
+            with self.assertRaises(relay.RouteRefused):
+                relay.resolve_background_route(self.logger)
+        with self.helper({"kind": "claude", "model": "claude-sonnet-5", "effort": None, "route_source": "live",
+                          "fallbacks": 7}):
+            with self.assertRaises(relay.RouteRefused):
+                relay.resolve_background_route(self.logger)
+
     def test_build_claude_cmd(self):
         self.assertEqual(relay.build_claude_cmd("claude", "claude-sonnet-5", 1.0, "t"),
                          ["claude", "--model", "claude-sonnet-5", "--max-budget-usd", "1.0", "-p", "t"])
@@ -153,6 +163,11 @@ class AutoExecutorModelTests(_RouteCase):
         with self.helper({"reason": "paused"}, exit_code=3):
             argv = self.run_message({"body": "hello", "from": "dawn", "model": "claude-sonnet-5"})
         self.assertIsNone(argv)
+
+    def test_an_unexpected_resolver_error_never_wedges_auto_exec(self):
+        with mock.patch.object(relay, "resolve_background_route", side_effect=TypeError("boom")):
+            argv = self.run_message({"body": "hello", "from": "dawn"})
+        self.assertIsNone(argv)  # run_message asserts active went back to 0
 
     def test_refused_route_never_launches_claude(self):
         with self.helper({"reason": "resolver answer cannot be honoured: x"}, exit_code=3):
