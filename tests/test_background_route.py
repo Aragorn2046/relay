@@ -34,7 +34,6 @@ class _RouteCase(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.fallback_log = self.root / "routing-fallback.jsonl"
         patches = [
-            mock.patch.object(relay, "ROUTING_FALLBACK_LOG", self.fallback_log),
             mock.patch.object(relay, "play_exec_alert", lambda *_: None),
             mock.patch.object(relay, "play_done_alert", lambda *_: None),
         ]
@@ -62,49 +61,46 @@ class _RouteCase(unittest.TestCase):
 
 
 class BackgroundRouteTests(_RouteCase):
-    def test_live_route_without_level(self):
-        with self.helper({"kind": "claude", "model": "claude-sonnet-5", "effort": None, "revision": 74,
-                          "route_source": "live", "fallbacks": []}):
-            route = relay.resolve_background_route(self.logger)
-        self.assertEqual((route["model"], route["effort"], route["fallback_model"]),
-                         ("claude-sonnet-5", None, None))
-        self.assertEqual(self.fallback_records(), [])
+    LIVE = {"kind": "claude", "model": "claude-opus-5-5", "effort": "high", "revision": 74,
+            "route_source": "live",
+            "fallbacks": [{"kind": "codex", "model": "gpt-6-astra", "effort": "medium"},
+                          {"kind": "claude", "model": "claude-sonnet-5", "effort": "low"}]}
 
-    def test_route_level_and_first_claude_fallback_are_used(self):
-        with self.helper({"kind": "claude", "model": "claude-opus-5-5", "effort": "high", "revision": 74,
-                          "route_source": "cache",
-                          "fallbacks": [{"kind": "claude", "model": "claude-opus-5", "effort": "high"}]}):
+    def test_live_route_rows_are_the_cards_claude_rows(self):
+        with self.helper(self.LIVE):
             route = relay.resolve_background_route(self.logger)
-        self.assertEqual((route["model"], route["effort"], route["fallback_model"]),
-                         ("claude-opus-5-5", "high", "claude-opus-5"))
+        self.assertEqual(route["rows"], [("claude-opus-5-5", "high"), ("claude-sonnet-5", "low")])
+        self.assertEqual(relay.pick_route_row(route), ("claude-opus-5-5", "high", "claude-sonnet-5"))
 
-    def test_default_route_runs_compiled_fallback_loudly(self):
+    def test_a_named_model_must_be_a_row_and_runs_at_that_rows_effort(self):
+        with self.helper(self.LIVE):
+            route = relay.resolve_background_route(self.logger)
+        self.assertEqual(relay.pick_route_row(route, "claude-sonnet-5"),
+                         ("claude-sonnet-5", "low", "claude-opus-5-5"))
+        for bad in ("opus", "sonnet", "claude-fable-5-1", "gpt-6-astra"):
+            with self.subTest(bad=bad), self.assertRaises(relay.RouteRefused):
+                relay.pick_route_row(route, bad)
+
+    def test_an_unreadable_registry_uses_session_routes_logged_default(self):
         with self.helper({"kind": "claude", "model": "claude-sonnet-5", "effort": None,
-                          "route_source": "default", "fallbacks": []}), \
-                self.assertLogs(self.logger, "WARNING"):
+                          "route_source": "default", "fallbacks": []}):
             route = relay.resolve_background_route(self.logger)
-        self.assertEqual((route["model"], route["source"]), (relay.ROUTE_FALLBACK_MODEL, "compiled-fallback"))
-        [record] = self.fallback_records()
-        self.assertEqual(record["consumer"], "background-claude")
-        self.assertEqual(record["chain"], [relay.ROUTE_FALLBACK_MODEL])
-        self.assertRegex(record["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-        self.assertIn("compiled default", record["reason"])
-        self.assertTrue(record["host"])
+        self.assertEqual(route["rows"], [("claude-sonnet-5", None)])
+        self.assertIn("compiled default", route["source"])
+        self.assertFalse(hasattr(relay, "ROUTE_FALLBACK_MODEL"))  # the relay has no model of its own
 
-    def test_missing_helper_runs_compiled_fallback_loudly(self):
+    def test_session_route_failures_refuse_never_guess(self):
         with mock.patch.dict(os.environ, {"SHELBY_SESSION_ROUTE": str(self.root / "absent.py")}):
-            route = relay.resolve_background_route(self.logger)
-        self.assertEqual(route["model"], relay.ROUTE_FALLBACK_MODEL)
-        self.assertIn("session-route exit", self.fallback_records()[0]["reason"])
-
-    def test_rejected_route_is_refused_not_replaced(self):
-        with self.helper({"source": "rejected", "route_source": "rejected",
-                          "reason": "resolver answer cannot be honoured: x"}, exit_code=3):
             with self.assertRaises(relay.RouteRefused):
                 relay.resolve_background_route(self.logger)
-        self.assertEqual(self.fallback_records(), [])
+        with self.helper({"kind": "claude"}, exit_code=2):
+            with self.assertRaises(relay.RouteRefused):
+                relay.resolve_background_route(self.logger)
 
-    def test_non_claude_route_is_refused(self):
+    def test_rejected_or_non_claude_route_is_refused(self):
+        with self.helper({"source": "rejected", "reason": "paused"}, exit_code=3):
+            with self.assertRaises(relay.RouteRefused):
+                relay.resolve_background_route(self.logger)
         with self.helper({"kind": "codex", "model": "gpt-6-astra", "effort": "medium",
                           "route_source": "live", "fallbacks": []}):
             with self.assertRaises(relay.RouteRefused):
@@ -131,7 +127,7 @@ class AutoExecutorModelTests(_RouteCase):
             print("done")
             """))
         config = SimpleNamespace(default_budget=1.0, max_budget=5.0, exec_timeout=30,
-                                 allowed_models=["sonnet", "opus", "haiku"], vault_path=None,
+                                 vault_path=None,
                                  log_dir=self.root / "logs", platform="test", max_concurrent=2)
         executor = relay.AutoExecutor(config, self.logger)
         executor.active = 1
@@ -147,11 +143,16 @@ class AutoExecutorModelTests(_RouteCase):
         self.assertEqual(argv[:2], ["--model", "claude-sonnet-5"])
         self.assertNotIn("--effort", argv)
 
-    def test_named_model_is_a_manual_override(self):
+    def test_a_named_model_outside_the_card_is_refused(self):
         with self.helper({"kind": "claude", "model": "claude-sonnet-5", "effort": None, "revision": 74,
                           "route_source": "live", "fallbacks": []}):
             argv = self.run_message({"body": "hello", "from": "dawn", "model": "opus"})
-        self.assertEqual(argv[:2], ["--model", "opus"])
+        self.assertIsNone(argv)
+
+    def test_a_named_model_never_beats_a_paused_card(self):
+        with self.helper({"reason": "paused"}, exit_code=3):
+            argv = self.run_message({"body": "hello", "from": "dawn", "model": "claude-sonnet-5"})
+        self.assertIsNone(argv)
 
     def test_refused_route_never_launches_claude(self):
         with self.helper({"reason": "resolver answer cannot be honoured: x"}, exit_code=3):

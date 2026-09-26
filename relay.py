@@ -52,14 +52,13 @@ TCP_READ_TIMEOUT = 5.0
 EXECUTION_TIMEOUT = 300  # 5 minutes
 
 # ── Model routing ──
-# An AUTO-EXEC message that names no model runs on the Model Routing registry's
-# background-claude policy, resolved per run by Config/scripts/session-route.py.
-# The compiled model below runs ONLY when that route cannot be read, and every
-# such run is logged loudly (stderr, daemon log, ~/.shelby/routing-fallback.jsonl).
+# Every AUTO-EXEC run follows the Model Routing registry's background-claude
+# card, resolved per run by Config/scripts/session-route.py. The relay has no
+# model of its own: when the registry cannot be read, session-route returns its
+# compiled default and logs it loudly (stderr + ~/.shelby/routing-fallback.jsonl);
+# when session-route itself fails, the run is refused, never guessed.
 ROUTE_CONSUMER = "background-claude"
-ROUTE_FALLBACK_MODEL = "claude-sonnet-5"  # routing-fallback
-ROUTING_FALLBACK_LOG = Path.home() / ".shelby" / "routing-fallback.jsonl"
-ROUTE_TIMEOUT = 5.0
+ROUTE_TIMEOUT = 15.0
 
 # ── Machine Detection ──
 
@@ -168,11 +167,14 @@ class Config:
         self.auto_execute_enabled = ae.get("enabled", True)
         self.max_concurrent = ae.get("max_concurrent", 2)
         self.exec_timeout = ae.get("timeout", EXECUTION_TIMEOUT)
-        # auto_execute.default_model is no longer read: an unnamed model is
-        # resolved from the Model Routing registry (see resolve_background_route).
+        # auto_execute.default_model and auto_execute.allowed_models are no
+        # longer read: the Model Routing registry decides (resolve_background_route).
         self.default_budget = ae.get("default_budget", 1.0)
         self.max_budget = ae.get("max_budget", 5.0)
-        self.allowed_models = ae.get("allowed_models", ["sonnet", "opus", "haiku"])
+        for retired in ("default_model", "allowed_models"):
+            if retired in ae:
+                print(f"WARNING: auto_execute.{retired} is ignored: the Model Routing registry "
+                      f"({ROUTE_CONSUMER}) decides the model", file=sys.stderr, flush=True)
 
         # Secret
         secret_file = self._expand(self.data.get("secret_file", "~/.relay-secret"))
@@ -426,68 +428,58 @@ def _session_route_helper():
     return str(home / "42" / "Config" / "scripts" / "session-route.py")
 
 
-def _log_route_fallback(logger, reason, chain):
-    """Loud trail for every compiled-fallback run: stderr, daemon log, jsonl."""
-    host = socket.gethostname().split(".")[0].lower()
-    line = f"WARNING: {ROUTE_CONSUMER}: registry route unavailable ({reason}); running compiled fallback {ROUTE_FALLBACK_MODEL}"
-    print(line, file=sys.stderr, flush=True)
-    if logger:
-        logger.warning(line)
-    record = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "consumer": ROUTE_CONSUMER,
-              "host": host, "reason": reason, "chain": chain}
-    try:
-        ROUTING_FALLBACK_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with ROUTING_FALLBACK_LOG.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
-    except OSError as exc:
-        print(f"WARNING: could not append {ROUTING_FALLBACK_LOG}: {exc}", file=sys.stderr, flush=True)
-
-
 def resolve_background_route(logger=None, timeout=ROUTE_TIMEOUT):
-    """Return {model, effort, fallback_model, source} for an unnamed-model run.
+    """The registry's background-claude card as {rows: [(model, effort)...], source}.
 
-    Raises RouteRefused when the registry answered with a route that must not
-    run (helper exit 3). Any other failure runs the compiled fallback, loudly.
+    Raises RouteRefused when the card refuses (helper exit 3), when it has no
+    Claude row, or when session-route itself cannot answer: a run is never
+    started on a guessed model. A registry that cannot be read is session-route's
+    job: it answers with its compiled default and logs that loudly.
     """
     helper = _session_route_helper()
-    reason = None
-    payload = None
     try:
         proc = subprocess.run(
             [sys.executable, helper, "--consumer", ROUTE_CONSUMER, "--json", "--timeout", str(timeout)],
-            capture_output=True, text=True, timeout=timeout + 10, check=False,
+            capture_output=True, text=True, errors="replace", timeout=timeout + 15, check=False,
         )
-        try:
-            payload = json.loads(proc.stdout)
-        except (ValueError, TypeError):
-            payload = None
-        if proc.returncode == 3 and isinstance(payload, dict):
-            raise RouteRefused(payload.get("reason") or "registry refused the route")
-        if proc.returncode != 0 or not isinstance(payload, dict):
-            first = (proc.stderr or "").strip().splitlines()[:1]
-            reason = f"session-route exit {proc.returncode}" + (f": {first[0][:200]}" if first else "")
     except (OSError, subprocess.TimeoutExpired) as exc:
-        reason = f"session-route unavailable: {type(exc).__name__}: {exc}"
+        raise RouteRefused(f"session-route did not answer: {type(exc).__name__}: {exc}") from exc
+    try:
+        payload = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        payload = None
+    if not isinstance(payload, dict):
+        first = (proc.stderr or "").strip().splitlines()[:1]
+        raise RouteRefused(f"session-route exit {proc.returncode}" + (f": {first[0][:200]}" if first else ""))
+    if proc.returncode != 0:
+        raise RouteRefused(payload.get("reason") or f"session-route exit {proc.returncode}")
+    rows = [(payload.get("model"), payload.get("effort"))] if payload.get("kind") == "claude" else []
+    rows += [(item.get("model"), item.get("effort")) for item in payload.get("fallbacks") or []
+             if isinstance(item, dict) and item.get("kind") == "claude"]
+    rows = [(m, e or None) for m, e in rows if isinstance(m, str) and m]
+    if not rows:
+        raise RouteRefused(f"the {ROUTE_CONSUMER} card has no Claude row")
+    source = ("compiled default (registry unreadable, logged by session-route)"
+              if payload.get("route_source") == "default"
+              else f"registry rev {payload.get('revision')} ({payload.get('route_source')})")
+    return {"rows": rows, "source": source}
 
-    if reason is None:
-        if payload.get("route_source") == "default":
-            reason = "session-route returned its compiled default (registry unreadable)"
-        elif payload.get("kind") != "claude" or not isinstance(payload.get("model"), str):
-            raise RouteRefused(f"route is not a Claude model: {payload.get('model')!r}")
 
-    if reason is not None:
-        _log_route_fallback(logger, reason, [ROUTE_FALLBACK_MODEL])
-        return {"model": ROUTE_FALLBACK_MODEL, "effort": None, "fallback_model": None,
-                "source": "compiled-fallback"}
-
-    fallback_model = None
-    for item in payload.get("fallbacks") or []:
-        if isinstance(item, dict) and item.get("kind") == "claude" and isinstance(item.get("model"), str):
-            fallback_model = item["model"]  # claude -p takes one overload fallback
-            break
-    return {"model": payload["model"], "effort": payload.get("effort") or None,
-            "fallback_model": fallback_model,
-            "source": f"registry rev {payload.get('revision')} ({payload.get('route_source')})"}
+def pick_route_row(route, requested_model=None):
+    """(model, effort, fallback_model) for this run. A message may name a model
+    only if that model is one of the card's own Claude rows (it then runs at
+    that row's effort); the card's next row is the CLI's overload fallback."""
+    rows = route["rows"]
+    index = 0
+    if requested_model:
+        matches = [i for i, (model, _) in enumerate(rows) if model == requested_model]
+        if not matches:
+            raise RouteRefused(f"model {requested_model!r} is not a row on the {ROUTE_CONSUMER} card "
+                               f"({', '.join(m for m, _ in rows)})")
+        index = matches[0]
+    model, effort = rows[index]
+    rest = [m for m, _ in rows[index + 1:] + rows[:index] if m != model]
+    return model, effort, (rest[0] if rest else None)
 
 
 def build_claude_cmd(claude_bin, model, budget, task, effort=None, fallback_model=None):
@@ -521,32 +513,21 @@ class AutoExecutor:
         task = msg.get("body", msg.get("message", ""))
         budget = min(float(msg.get("budget", self.config.default_budget)), self.config.max_budget)
         explicit_model = msg.get("model")
-        effort = None
-        fallback_model = None
-        if explicit_model:
-            # A message that names a model is a manual override of the registry.
-            model = explicit_model
-            if model not in self.config.allowed_models:
-                self.logger.warning(f"AUTO-EXEC rejected: invalid model '{model}' from {msg.get('from', 'unknown')}")
-                with self.lock:
-                    self.active -= 1
-                return
-            route_note = "message override"
-        else:
-            try:
-                route = resolve_background_route(self.logger)
-            except RouteRefused as exc:
-                reason = f"REFUSED: the Model Routing registry route for {ROUTE_CONSUMER} cannot run: {exc}"
-                self.logger.error(f"AUTO-EXEC {reason} (task: {task[:80]})")
-                print(f"ERROR: {reason}", file=sys.stderr, flush=True)
-                self._log_to_vault(task, reason, False, 0.0, "(refused)", budget)
-                if msg.get("reply_to"):
-                    self._send_result_back(msg, reason, False)
-                with self.lock:
-                    self.active -= 1
-                return
-            model, effort, fallback_model = route["model"], route["effort"], route["fallback_model"]
-            route_note = route["source"]
+        # The registry always decides; a message may only pick one of the card's rows.
+        try:
+            route = resolve_background_route(self.logger)
+            model, effort, fallback_model = pick_route_row(route, explicit_model)
+        except RouteRefused as exc:
+            reason = f"REFUSED: the Model Routing registry route for {ROUTE_CONSUMER} cannot run: {exc}"
+            self.logger.error(f"AUTO-EXEC {reason} (task: {task[:80]})")
+            print(f"ERROR: {reason}", file=sys.stderr, flush=True)
+            self._log_to_vault(task, reason, False, 0.0, "(refused)", budget)
+            if msg.get("reply_to"):
+                self._send_result_back(msg, reason, False)
+            with self.lock:
+                self.active -= 1
+            return
+        route_note = route["source"] + (f", message chose row {model}" if explicit_model else "")
         sender = msg.get("from", "unknown")
 
         self.logger.info(f"AUTO-EXEC from {sender}: {task[:120]} (model={model}, effort={effort or '-'}, "
