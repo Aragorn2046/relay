@@ -24,33 +24,38 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import re
 import logging
 import os
 import shutil
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 DEFAULT_PORT = 7272
 MAX_MESSAGE_SIZE = 1_048_576  # 1 MB
 HMAC_MAX_AGE = 300.0  # 5 minutes
 RATE_LIMIT = 10  # connections per second per IP
 FILE_POLL_INTERVAL = 5  # seconds
 DEDUP_TTL = 3600.0  # 1 hour
+STORE_MAX_ROWS = 200_000
 TCP_CONNECT_TIMEOUT = 2.0
 TCP_READ_TIMEOUT = 5.0
 EXECUTION_TIMEOUT = 300  # 5 minutes
+
+assert DEDUP_TTL >= 2 * HMAC_MAX_AGE, "dedup TTL must cover the full HMAC replay window"
 
 # ── Model routing ──
 # Every AUTO-EXEC run follows the Model Routing registry's background-claude
@@ -155,6 +160,7 @@ class Config:
         self.socket_path = self._expand(self.data.get("socket_path", "/tmp/relay.sock"))
         self.log_dir = Path(self._expand(self.data.get("log_dir", "~/logs")))
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir = Path(self._expand(self.data.get("state_dir", "~/.shelby/relay")))
 
         # File fallback paths
         fb = self.data.get("file_fallback", {})
@@ -168,9 +174,10 @@ class Config:
 
         # Auto-execution config
         ae = self.data.get("auto_execute", {})
-        self.auto_execute_enabled = ae.get("enabled", True)
+        self.auto_execute_enabled = ae.get("enabled") is True
         self.max_concurrent = ae.get("max_concurrent", 2)
         self.exec_timeout = ae.get("timeout", EXECUTION_TIMEOUT)
+        self.max_queue_age = ae.get("max_queue_age", 3600)
         # auto_execute.default_model and auto_execute.allowed_models are no
         # longer read: the Model Routing registry decides (resolve_background_route).
         self.default_budget = ae.get("default_budget", 1.0)
@@ -266,24 +273,40 @@ def sign_message(payload, secret):
     return payload
 
 
-def verify_message(message, secret, max_age=HMAC_MAX_AGE):
-    """Verify HMAC signature and timestamp freshness."""
-    signature = message.pop("signature", None)
-    if not signature:
+def verify_message(message, secret, max_age=HMAC_MAX_AGE, now=None):
+    """Verify a signed relay message without changing the caller's object."""
+    try:
+        if not isinstance(secret, str) or not secret or not isinstance(message, dict):
+            return False
+
+        signature = message.get("signature")
+        if not isinstance(signature, str) or not re.fullmatch(r"[0-9a-f]{64}", signature):
+            return False
+
+        timestamp = message.get("timestamp")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            return False
+        if not math.isfinite(timestamp):
+            return False
+        now = time.time() if now is None else now
+        if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
+            return False
+        if isinstance(max_age, bool) or not isinstance(max_age, (int, float)) or not math.isfinite(max_age):
+            return False
+        if abs(now - timestamp) > max_age:
+            return False
+
+        msg_id = message.get("msg_id")
+        if not isinstance(msg_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", msg_id):
+            return False
+
+        unsigned = dict(message)
+        unsigned.pop("signature", None)
+        canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"))
+        expected = hmac.new(secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature, expected)
+    except Exception:
         return False
-
-    ts = message.get("timestamp", 0)
-    if abs(time.time() - ts) > max_age:
-        return False
-
-    canonical = json.dumps(message, sort_keys=True, separators=(",", ":"))
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        canonical.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-
-    return hmac.compare_digest(signature, expected)
 
 
 # ── Message Framing ──
@@ -309,27 +332,125 @@ def frame_and_encode(msg_dict):
     return frame_message(payload)
 
 
-# ── Deduplication ──
+# ── Durable message state and deduplication ──
 
-class DeduplicationFilter:
-    def __init__(self, ttl=DEDUP_TTL):
-        self.seen = OrderedDict()
-        self.ttl = ttl
+class RelayStore:
+    """SQLite-backed queue and replay store shared by the event loop and workers."""
 
-    def is_duplicate(self, msg_id):
-        self._expire()
-        if msg_id in self.seen:
-            return True
-        self.seen[msg_id] = time.time()
-        return False
+    STATES = frozenset({"queued", "executing", "done", "failed", "held"})
 
-    def _expire(self):
-        cutoff = time.time() - self.ttl
-        while self.seen:
-            oldest_id, oldest_time = next(iter(self.seen.items()))
-            if oldest_time > cutoff:
-                break
-            self.seen.pop(oldest_id)
+    def __init__(self, state_dir):
+        self.state_dir = Path(state_dir).expanduser()
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.state_dir, 0o700)
+        self.path = self.state_dir / "relay-state.sqlite3"
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        os.chmod(self.path, 0o600)
+        self.lock = threading.Lock()
+        self.connection = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
+        self.connection.row_factory = sqlite3.Row
+        with self.lock:
+            self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA synchronous=FULL")
+            self.connection.execute("""CREATE TABLE IF NOT EXISTS messages (
+                msg_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                state TEXT NOT NULL,
+                received_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                payload TEXT
+            )""")
+            self.connection.commit()
+            self._secure_modes()
+
+    def _secure_modes(self):
+        for path in (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
+            try:
+                if path.exists():
+                    os.chmod(path, 0o600)
+            except OSError:
+                pass
+
+    def enqueue(self, msg_id, message_dict, source):
+        payload = json.dumps(message_dict, sort_keys=True, separators=(",", ":"))
+        now = time.time()
+        with self.lock:
+            cursor = self.connection.execute(
+                "INSERT OR IGNORE INTO messages (msg_id, source, state, received_at, updated_at, payload) "
+                "VALUES (?, ?, 'queued', ?, ?, ?)",
+                (msg_id, source, now, now, payload),
+            )
+            self.connection.commit()
+            self._secure_modes()
+            return cursor.rowcount == 1
+
+    def set_state(self, msg_id, state):
+        if state not in self.STATES:
+            raise ValueError(f"invalid relay state: {state}")
+        now = time.time()
+        with self.lock:
+            if state in ("done", "failed"):
+                self.connection.execute(
+                    "UPDATE messages SET state = ?, updated_at = ?, payload = NULL WHERE msg_id = ?",
+                    (state, now, msg_id),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE messages SET state = ?, updated_at = ? WHERE msg_id = ?",
+                    (state, now, msg_id),
+                )
+            self.connection.commit()
+            self._secure_modes()
+
+    def get(self, msg_id):
+        with self.lock:
+            row = self.connection.execute("SELECT * FROM messages WHERE msg_id = ?", (msg_id,)).fetchone()
+            return self._decode_row(row)
+
+    def list_state(self, state):
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT * FROM messages WHERE state = ? ORDER BY received_at ASC, msg_id ASC", (state,)
+            ).fetchall()
+            return [self._decode_row(row) for row in rows]
+
+    def counts(self):
+        with self.lock:
+            rows = self.connection.execute("SELECT state, COUNT(*) AS count FROM messages GROUP BY state").fetchall()
+            return {row["state"]: row["count"] for row in rows}
+
+    def prune(self, now=None):
+        now = time.time() if now is None else now
+        cutoff = now - DEDUP_TTL
+        terminal = ("done", "failed", "held")
+        placeholders = ",".join("?" for _ in terminal)
+        with self.lock:
+            self.connection.execute(
+                f"DELETE FROM messages WHERE state IN ({placeholders}) AND received_at < ?",
+                (*terminal, cutoff),
+            )
+            count = self.connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            excess = max(0, count - STORE_MAX_ROWS)
+            if excess:
+                self.connection.execute(
+                    f"DELETE FROM messages WHERE msg_id IN (SELECT msg_id FROM messages "
+                    f"WHERE state IN ({placeholders}) ORDER BY received_at ASC LIMIT ?)",
+                    (*terminal, excess),
+                )
+            self.connection.commit()
+            self._secure_modes()
+
+    def _decode_row(self, row):
+        if row is None:
+            return None
+        item = dict(row)
+        item["payload"] = json.loads(item["payload"]) if item["payload"] is not None else None
+        return item
+
+    def close(self):
+        with self.lock:
+            self.connection.close()
 
 
 # ── Rate Limiting ──
@@ -514,13 +635,14 @@ def build_claude_cmd(claude_bin, model, budget, task, effort=None, fallback_mode
         cmd += ["--effort", effort]
     if fallback_model and fallback_model != model:
         cmd += ["--fallback-model", fallback_model]
-    return cmd + ["--max-budget-usd", str(budget), "-p", task]
+    return cmd + ["--max-budget-usd", str(budget), "-p", "--", task]
 
 
 class AutoExecutor:
-    def __init__(self, config, logger):
+    def __init__(self, config, logger, store=None):
         self.config = config
         self.logger = logger
+        self.store = store
         self.active = 0
         self.lock = threading.Lock()
 
@@ -528,109 +650,162 @@ class AutoExecutor:
         with self.lock:
             return self.active < self.config.max_concurrent
 
-    def execute(self, msg):
-        """Run auto-execution in a thread (subprocess is blocking)."""
+    def _is_admitted(self, msg):
+        if self.store is None:
+            return True
+        msg_id = msg.get("msg_id") if isinstance(msg, dict) else None
+        row = self.store.get(msg_id) if isinstance(msg_id, str) else None
+        return bool(row and row["state"] == "executing" and row.get("payload") == msg)
+
+    def execute(self, msg, on_done=None):
+        """Start an admitted task in a worker; refuse disabled or full queues."""
+        if getattr(self.config, "auto_execute_enabled", False) is not True:
+            self.logger.warning("AUTO-EXEC disabled (auto_execute.enabled is not true): refusing execution")
+            return False
+        if not self._is_admitted(msg):
+            self.logger.error("AUTO-EXEC refused: message is not durably admitted as executing")
+            return False
         with self.lock:
+            if self.active >= self.config.max_concurrent:
+                return False
             self.active += 1
-        t = threading.Thread(target=self._run, args=(msg,), daemon=True)
-        t.start()
-
-    def _run(self, msg):
-        task = msg.get("body", msg.get("message", ""))
-        budget = min(float(msg.get("budget", self.config.default_budget)), self.config.max_budget)
-        explicit_model = msg.get("model")
-        # The registry always decides; a message may only pick one of the card's rows.
         try:
+            t = threading.Thread(target=self._run, args=(msg, on_done), daemon=True)
+            t.start()
+            return True
+        except Exception as exc:
+            with self.lock:
+                self.active -= 1
             try:
-                route = resolve_background_route(self.logger)
-                model, effort, fallback_model = pick_route_row(route, explicit_model)
-            except RouteRefused:
-                raise
-            except Exception as exc:  # never wedge auto-exec on an unexpected answer
-                raise RouteRefused(f"route could not be read: {type(exc).__name__}: {exc}") from exc
-        except RouteRefused as exc:
-            reason = f"REFUSED: the Model Routing registry route for {ROUTE_CONSUMER} cannot run: {exc}"
-            try:
-                self.logger.error(f"AUTO-EXEC {reason} (task: {task[:80]})")
-                print(f"ERROR: {reason}", file=sys.stderr, flush=True)
-                self._log_to_vault(task, reason, False, 0.0, "(refused)", budget)
-                if msg.get("reply_to"):
-                    self._send_result_back(msg, reason, False)
-            except Exception as log_exc:  # never leak the concurrency slot
-                self.logger.error(f"AUTO-EXEC refusal could not be reported: {log_exc}")
-            finally:
-                with self.lock:
-                    self.active -= 1
+                self.logger.error(f"AUTO-EXEC could not start worker: {exc}")
+            except Exception:
+                pass
+            self._call_on_done(on_done, False)
+            return False
+
+    def _call_on_done(self, on_done, success):
+        if on_done is None:
             return
-        route_note = route["source"] + (f", message chose row {model}" if explicit_model else "")
-        sender = msg.get("from", "unknown")
-
-        self.logger.info(f"AUTO-EXEC from {sender}: {task[:120]} (model={model}, effort={effort or '-'}, "
-                         f"route={route_note}, budget=${budget})")
-        play_exec_alert(self.config.platform)
-
-        start = time.time()
-        success = False
-        result = ""
-
-        env = os.environ.copy()
-        env.pop("CLAUDECODE", None)
-        # Daemons spawned outside an interactive shell don't inherit fnm/Homebrew
-        # PATH entries, so `claude` isn't resolvable. Prepend the common install
-        # locations so subprocess can find the binary on both WSL and macOS.
-        home = Path.home()
-        extra_path = ":".join(str(p) for p in [
-            home / ".local/share/fnm/aliases/default/bin",
-            home / ".local/bin",
-            home / ".bun/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-        ])
-        env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
-        claude_bin = shutil.which("claude", path=env["PATH"])
-
         try:
-            if not claude_bin:
-                raise FileNotFoundError(
-                    f"'claude' binary not on PATH. Looked in: {extra_path}"
+            on_done(success)
+        except Exception as exc:
+            try:
+                self.logger.error(f"AUTO-EXEC completion callback failed: {exc}")
+            except Exception:
+                pass
+
+    def _run(self, msg, on_done=None):
+        success = False
+        task = ""
+        budget = 0.0
+        model = "(unknown)"
+        try:
+            if self.store is not None and getattr(self.config, "auto_execute_enabled", False) is not True:
+                self.logger.warning("AUTO-EXEC disabled (auto_execute.enabled is not true): refusing execution")
+                return
+            if not self._is_admitted(msg):
+                self.logger.error("AUTO-EXEC refused: message is not durably admitted as executing")
+                return
+            task = msg.get("body", msg.get("message", ""))
+            budget = min(float(msg.get("budget", self.config.default_budget)), self.config.max_budget)
+            explicit_model = msg.get("model")
+            # The registry always decides; a message may only pick one of the card's rows.
+            try:
+                try:
+                    route = resolve_background_route(self.logger)
+                    model, effort, fallback_model = pick_route_row(route, explicit_model)
+                except RouteRefused:
+                    raise
+                except Exception as exc:  # never wedge auto-exec on an unexpected answer
+                    raise RouteRefused(f"route could not be read: {type(exc).__name__}: {exc}") from exc
+            except RouteRefused as exc:
+                reason = f"REFUSED: the Model Routing registry route for {ROUTE_CONSUMER} cannot run: {exc}"
+                try:
+                    self.logger.error(f"AUTO-EXEC {reason} (task: {task[:80]})")
+                    print(f"ERROR: {reason}", file=sys.stderr, flush=True)
+                    self._log_to_vault(task, reason, False, 0.0, "(refused)", budget)
+                    if msg.get("reply_to"):
+                        self._send_result_back(msg, reason, False)
+                except Exception as log_exc:  # never leak the concurrency slot
+                    try:
+                        self.logger.error(f"AUTO-EXEC refusal could not be reported: {log_exc}")
+                    except Exception:
+                        pass
+                return
+
+            route_note = route["source"] + (f", message chose row {model}" if explicit_model else "")
+            sender = msg.get("from", "unknown")
+            self.logger.info(f"AUTO-EXEC from {sender}: {task[:120]} (model={model}, effort={effort or '-'}, "
+                             f"route={route_note}, budget=${budget})")
+            play_exec_alert(self.config.platform)
+
+            start = time.time()
+            result = ""
+            env = os.environ.copy()
+            env.pop("CLAUDECODE", None)
+            # Daemons spawned outside an interactive shell don't inherit fnm/Homebrew
+            # PATH entries, so `claude` isn't resolvable. Prepend common install paths.
+            home = Path.home()
+            extra_path = ":".join(str(p) for p in [
+                home / ".local/share/fnm/aliases/default/bin",
+                home / ".local/bin",
+                home / ".bun/bin",
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+            ])
+            env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
+            claude_bin = shutil.which("claude", path=env["PATH"])
+
+            try:
+                if not claude_bin:
+                    raise FileNotFoundError(f"'claude' binary not on PATH. Looked in: {extra_path}")
+                cmd = build_claude_cmd(claude_bin, model, budget, task, effort, fallback_model)
+                cwd = str(home / "workspace")
+                if not Path(cwd).exists():
+                    cwd = str(home)
+
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=self.config.exec_timeout, cwd=cwd, env=env
                 )
-            cmd = build_claude_cmd(claude_bin, model, budget, task, effort, fallback_model)
-            cwd = str(home / "workspace")
-            if not Path(cwd).exists():
-                cwd = str(home)
+                result = proc.stdout or ""
+                if proc.returncode == 0:
+                    success = True
+                else:
+                    result += f"\nSTDERR: {proc.stderr or '(none)'}"
+            except subprocess.TimeoutExpired:
+                result = f"TIMEOUT after {self.config.exec_timeout}s"
+            except FileNotFoundError as exc:
+                result = f"CLAUDE BINARY NOT FOUND: {exc}"
+                self.logger.error(f"AUTO-EXEC PATH failure: {exc}")
+            except Exception as exc:
+                result = f"ERROR: {type(exc).__name__}: {exc}"
 
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=self.config.exec_timeout, cwd=cwd, env=env
-            )
-            result = proc.stdout or ""
-            if proc.returncode == 0:
-                success = True
-            else:
-                result += f"\nSTDERR: {proc.stderr or '(none)'}"
-        except subprocess.TimeoutExpired:
-            result = f"TIMEOUT after {self.config.exec_timeout}s"
-        except FileNotFoundError as e:
-            result = f"CLAUDE BINARY NOT FOUND: {e}"
-            self.logger.error(f"AUTO-EXEC PATH failure: {e}")
-        except Exception as e:
-            result = f"ERROR: {type(e).__name__}: {e}"
-
-        duration = time.time() - start
-        status = "SUCCESS" if success else "FAILED"
-        self.logger.info(f"AUTO-EXEC {status} ({duration:.0f}s): {task[:80]}")
-
-        # Log to vault
-        self._log_to_vault(task, result, success, duration, model, budget)
-
-        # Send result back
-        if msg.get("reply_to"):
-            self._send_result_back(msg, result, success)
-
-        play_done_alert(self.config.platform)
-
-        with self.lock:
-            self.active -= 1
+            duration = time.time() - start
+            status = "SUCCESS" if success else "FAILED"
+            self.logger.info(f"AUTO-EXEC {status} ({duration:.0f}s): {task[:80]}")
+            try:
+                self._log_to_vault(task, result, success, duration, model, budget)
+            except Exception as exc:
+                self.logger.warning(f"Failed to report execution: {exc}")
+            if msg.get("reply_to"):
+                try:
+                    self._send_result_back(msg, result, success)
+                except Exception as exc:
+                    self.logger.warning(f"Failed to relay result back: {exc}")
+            try:
+                play_done_alert(self.config.platform)
+            except Exception as exc:
+                self.logger.warning(f"AUTO-EXEC completion alert failed: {exc}")
+        except Exception as exc:
+            try:
+                self.logger.error(f"AUTO-EXEC unexpected failure: {type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+        finally:
+            with self.lock:
+                self.active = max(0, self.active - 1)
+            self._call_on_done(on_done, success)
 
     def _log_to_vault(self, task, result, success, duration, model, budget):
         try:
@@ -670,12 +845,13 @@ class RelayDaemon:
     def __init__(self, config):
         self.config = config
         self.logger = self._setup_logging()
-        self.dedup = DeduplicationFilter()
+        self.store = RelayStore(config.state_dir)
         self.rate_limiter = RateLimiter()
-        self.executor = AutoExecutor(config, self.logger)
+        self.executor = AutoExecutor(config, self.logger, store=self.store)
         self.shutdown_event = None  # Created in run() to bind to correct loop
         self.start_time = time.time()
         self.stats = {"tcp_received": 0, "tcp_sent": 0, "file_received": 0, "file_sent": 0}
+        self._queue_logged = set()
 
     def _setup_logging(self):
         logger = logging.getLogger("relay")
@@ -713,10 +889,8 @@ class RelayDaemon:
             if not isinstance(message, dict):
                 raise ValueError("Message must be a JSON object")
 
-            msg_type = message.get("type", "relay")
-
             # Ping: no auth required
-            if msg_type == "ping":
+            if message.get("type", "relay") == "ping":
                 resp = {
                     "type": "pong",
                     "machine": self.config.machine,
@@ -732,7 +906,7 @@ class RelayDaemon:
 
             # All other messages require HMAC
             if not self.config.secret:
-                self.logger.error("No shared secret configured — rejecting message")
+                self.logger.warning("TCP message refused: no shared secret configured")
                 writer.close()
                 await writer.wait_closed()
                 return
@@ -743,9 +917,21 @@ class RelayDaemon:
                 await writer.wait_closed()
                 return
 
-            # Deduplication
             msg_id = message.get("msg_id", "")
-            if self.dedup.is_duplicate(msg_id):
+            message_without_signature = dict(message)
+            message_without_signature.pop("signature", None)
+            try:
+                is_new = self.store.enqueue(msg_id, message_without_signature, "tcp")
+            except Exception as exc:
+                self.logger.error(f"Failed to durably enqueue TCP message {msg_id}: {exc}")
+                resp = {"status": "error", "error": "enqueue failed", "msg_id": msg_id}
+                writer.write(frame_and_encode(resp))
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            if not is_new:
                 resp = {"status": "ok", "note": "duplicate", "msg_id": msg_id}
                 writer.write(frame_and_encode(resp))
                 await writer.drain()
@@ -753,7 +939,6 @@ class RelayDaemon:
                 await writer.wait_closed()
                 return
 
-            # ACK immediately
             resp = {"status": "ok", "msg_id": msg_id}
             writer.write(frame_and_encode(resp))
             await writer.drain()
@@ -761,9 +946,7 @@ class RelayDaemon:
             await writer.wait_closed()
 
             self.stats["tcp_received"] += 1
-
-            # Process the message
-            await self._process_message(message)
+            self._dispatch(msg_id)
 
         except (asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
             self.logger.warning(f"Connection error from {peer_ip}: {e}")
@@ -778,25 +961,130 @@ class RelayDaemon:
             except Exception:
                 pass
 
-    async def _process_message(self, message):
-        """Route a received message: display, auto-execute, or store."""
-        sender = message.get("from", "unknown")
-        body = message.get("body", message.get("message", "(empty)"))
-        auto = message.get("auto_execute", False)
-        tags = message.get("tags", [])
+    def _write_held_file(self, msg_id, message, reason):
+        held_dir = self.config.state_dir / "held"
+        held_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(held_dir, 0o700)
+        held_path = held_dir / f"{msg_id}.json"
+        record = dict(message)
+        record["held_reason"] = reason
+        record["held_at"] = time.time()
+        tmp_path = held_dir / f".{msg_id}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(record, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp_path, held_path)
+            os.chmod(held_path, 0o600)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+        return held_path
 
-        if auto or "AUTO" in tags:
-            if self.executor.can_accept():
-                self.executor.execute(message)
+    def _hold_message(self, msg_id, message, reason):
+        try:
+            held_path = self._write_held_file(msg_id, message, reason)
+            if reason == "AUTO-EXEC disabled; manual pickup required":
+                self.logger.warning(
+                    f"AUTO-EXEC disabled (auto_execute.enabled is not true): held for manual pickup: {held_path}"
+                )
             else:
-                self.logger.warning(f"Max concurrent executions reached, queuing: {body[:80]}")
-                # Write to file inbox for later processing
-                inbox = self.config.get_my_file_inbox()
-                if inbox:
-                    self._write_file_message(inbox, message)
-        else:
+                self.logger.warning(f"AUTO-EXEC held for manual pickup: {held_path} ({reason})")
+        except OSError as exc:
+            self.logger.error(f"Could not write held message {msg_id}: {exc}")
+        self.store.set_state(msg_id, "held")
+
+    def recover_interrupted(self):
+        """Never retry tasks whose worker may have started before a crash."""
+        for row in self.store.list_state("executing"):
+            reason = "interrupted during execution; not re-run automatically"
+            try:
+                self._write_held_file(row["msg_id"], row.get("payload") or {}, reason)
+            except OSError as exc:
+                self.logger.error(f"Could not write recovery hold for {row['msg_id']}: {exc}")
+            self.store.set_state(row["msg_id"], "held")
+            self.logger.warning(f"Recovered interrupted execution as held: {row['msg_id']}")
+
+    def _is_auto_message(self, message):
+        tags = message.get("tags", [])
+        tagged_auto = isinstance(tags, (list, tuple, set)) and "AUTO" in tags
+        return bool(message.get("auto_execute")) or tagged_auto
+
+    def _dispatch(self, msg_id):
+        """Dispatch one durably queued message, or leave it queued for the drain."""
+        row = self.store.get(msg_id)
+        if not row or row["state"] != "queued":
+            return
+        message = row.get("payload") or {}
+        if not self._is_auto_message(message):
+            sender = message.get("from", "unknown")
+            body = message.get("body", message.get("message", "(empty)"))
             play_alert(self.config.platform)
             self.logger.info(f"Message from {sender}: {body[:200]}")
+            self.store.set_state(msg_id, "done")
+            return
+
+        if self.config.auto_execute_enabled is not True:
+            self._hold_message(msg_id, message, "AUTO-EXEC disabled; manual pickup required")
+            return
+
+        try:
+            max_queue_age = float(self.config.max_queue_age)
+        except (TypeError, ValueError):
+            max_queue_age = 3600.0
+        if time.time() - row["received_at"] > max_queue_age:
+            self._hold_message(msg_id, message, "AUTO-EXEC queue age exceeded; manual pickup required")
+            return
+
+        if not self.executor.can_accept():
+            if msg_id not in self._queue_logged:
+                body = message.get("body", message.get("message", ""))
+                self.logger.warning(f"Max concurrent executions reached, queued: {str(body)[:80]}")
+                self._queue_logged.add(msg_id)
+            return
+
+        self.store.set_state(msg_id, "executing")
+
+        def on_done(success):
+            self.store.set_state(msg_id, "done" if success else "failed")
+            self._queue_logged.discard(msg_id)
+
+        try:
+            accepted = self.executor.execute(message, on_done=on_done)
+            if not accepted:
+                current = self.store.get(msg_id)
+                if current and current["state"] == "executing":
+                    self.store.set_state(msg_id, "queued")
+        except Exception as exc:
+            self.logger.error(f"Could not start queued execution {msg_id}: {exc}")
+            current = self.store.get(msg_id)
+            if current and current["state"] == "executing":
+                self.store.set_state(msg_id, "failed")
+
+    async def drain_queued(self):
+        last_prune = 0.0
+        while not self.shutdown_event.is_set():
+            try:
+                for row in self.store.list_state("queued"):
+                    self._dispatch(row["msg_id"])
+                now = time.monotonic()
+                if now - last_prune >= 60.0:
+                    self.store.prune()
+                    last_prune = now
+                await asyncio.sleep(FILE_POLL_INTERVAL)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.logger.error(f"Queue drain error: {exc}")
+                await asyncio.sleep(FILE_POLL_INTERVAL)
+
+    async def _process_message(self, message):
+        """Compatibility helper for callers that already durably enqueued."""
+        self._dispatch(message["msg_id"])
 
     # ── Unix Socket Server (local CLI IPC) ──
 
@@ -849,6 +1137,9 @@ class RelayDaemon:
 
     async def _send_to_target(self, target, message):
         """Send via TCP, fall back to file."""
+        if not isinstance(self.config.secret, str) or not self.config.secret:
+            self.logger.error("Cannot send: no shared secret configured")
+            return {"method": "error", "error": "no shared secret configured"}
         if target == self.config.machine:
             return {"method": "error", "error": "Cannot send to self"}
 
@@ -857,8 +1148,7 @@ class RelayDaemon:
             return {"method": "error", "error": f"Unknown target: {target}"}
 
         # Sign the message
-        if self.config.secret:
-            message = sign_message(message, self.config.secret)
+        message = sign_message(dict(message), self.config.secret)
 
         # Try TCP first
         try:
@@ -955,8 +1245,11 @@ class RelayDaemon:
                 seen.add(f.name)
             # Process any existing messages
             for f in sorted(inbox.glob("*.json")):
-                await self._process_file_message(f)
-                seen.add(f.name)
+                result = await self._process_file_message(f)
+                if result == "retry":
+                    seen.discard(f.name)
+                else:
+                    seen.add(f.name)
 
         while not self.shutdown_event.is_set():
             try:
@@ -968,7 +1261,9 @@ class RelayDaemon:
                 for msg_path in sorted(inbox.glob("*.json")):
                     if msg_path.name not in seen:
                         seen.add(msg_path.name)
-                        await self._process_file_message(msg_path)
+                        result = await self._process_file_message(msg_path)
+                        if result == "retry":
+                            seen.discard(msg_path.name)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -977,29 +1272,67 @@ class RelayDaemon:
     async def _process_file_message(self, msg_path):
         """Process a file-based message."""
         try:
-            msg = json.loads(msg_path.read_text())
+            if msg_path.stat().st_size > MAX_MESSAGE_SIZE:
+                self._reject_file(msg_path, "too-large")
+                return "rejected"
+            msg = json.loads(msg_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._reject_file(msg_path, "bad-json")
+            return "rejected"
+        except OSError as exc:
+            self.logger.warning(f"Could not read file message {msg_path.name}: {type(exc).__name__}")
+            return "seen"
 
-            # HMAC is mandatory when a secret is configured
-            if self.config.secret:
-                if not verify_message(msg, self.config.secret):
-                    self.logger.warning(f"HMAC failed/missing on file message: {msg_path.name}")
-                    return
+        if not isinstance(msg, dict):
+            self._reject_file(msg_path, "bad-json")
+            return "rejected"
+        if not isinstance(self.config.secret, str) or not self.config.secret:
+            self._reject_file(msg_path, "unsigned-no-secret")
+            return "rejected"
+        if not verify_message(msg, self.config.secret):
+            self._reject_file(msg_path, self._file_verification_reason(msg))
+            return "rejected"
 
-            # Dedup
-            msg_id = msg.get("msg_id", msg_path.name)
-            if self.dedup.is_duplicate(msg_id):
-                # Archive duplicate silently
-                self._archive_file(msg_path)
-                return
+        msg_id = msg["msg_id"]
+        message_without_signature = dict(msg)
+        message_without_signature.pop("signature", None)
+        try:
+            is_new = self.store.enqueue(msg_id, message_without_signature, "file")
+        except Exception as exc:
+            self.logger.error(f"Failed to durably enqueue file message {msg_path.name}: {exc}")
+            return "retry"
 
+        self._archive_file(msg_path)
+        if is_new:
             self.stats["file_received"] += 1
-            await self._process_message(msg)
+            self._dispatch(msg_id)
+        return "processed"
 
-            # Archive processed message
-            self._archive_file(msg_path)
+    def _file_verification_reason(self, message):
+        signature = message.get("signature")
+        if not isinstance(signature, str):
+            return "unsigned"
+        timestamp = message.get("timestamp")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            return "bad-timestamp"
+        try:
+            if not math.isfinite(timestamp) or abs(time.time() - timestamp) > HMAC_MAX_AGE:
+                return "stale"
+        except (OverflowError, TypeError, ValueError):
+            return "bad-timestamp"
+        return "bad-signature"
 
-        except (json.JSONDecodeError, OSError) as e:
-            self.logger.warning(f"Error reading file message {msg_path.name}: {e}")
+    def _reject_file(self, msg_path, reason):
+        self.logger.warning(f"Rejected file message {msg_path.name}: {reason}")
+        try:
+            root = self.config._get_file_root() or msg_path.parent.parent
+            rejected = root / "rejected"
+            rejected.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(rejected, 0o700)
+            msg_path.rename(rejected / msg_path.name)
+        except OSError:
+            # The watcher's seen set prevents repeated logs while the source remains.
+            pass
 
     def _archive_file(self, msg_path):
         """Move processed message to archive."""
@@ -1071,6 +1404,7 @@ class RelayDaemon:
             "inbox": inbox_count,
             "outbox": outbox_counts,
             "archive": archive_count,
+            "held": self.store.counts().get("held", 0),
             "stats": self.stats,
         }
 
@@ -1100,12 +1434,15 @@ class RelayDaemon:
         self.shutdown_event = asyncio.Event()
         self.logger.info(f"Relay daemon v{VERSION} starting on {self.config.machine}")
 
+        self.store.prune()
+        self.recover_interrupted()
+
         if not self.config.tailscale_ip:
             self.logger.error("Cannot determine Tailscale IP — aborting")
             return
 
         if not self.config.secret:
-            self.logger.warning("No shared secret — HMAC disabled (insecure!)")
+            self.logger.error("No shared secret configured — all inbound messages will be refused and all outbound sends will fail")
 
         # Set up signal handlers
         loop = asyncio.get_running_loop()
@@ -1135,6 +1472,7 @@ class RelayDaemon:
 
         # Start file watcher
         watcher_task = asyncio.create_task(self.watch_file_inbox())
+        drain_task = asyncio.create_task(self.drain_queued())
 
         self.logger.info("Daemon ready")
 
@@ -1147,8 +1485,13 @@ class RelayDaemon:
         uds_server.close()
         await uds_server.wait_closed()
         watcher_task.cancel()
+        drain_task.cancel()
         try:
             await watcher_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await drain_task
         except asyncio.CancelledError:
             pass
 
@@ -1156,6 +1499,7 @@ class RelayDaemon:
         if sock_path.exists():
             sock_path.unlink()
 
+        self.store.close()
         self.logger.info("Shutdown complete")
 
 
@@ -1198,8 +1542,10 @@ def _direct_send(target, message):
     """Send without daemon (fallback for when daemon is down)."""
     config = Config()
 
-    if config.secret:
-        message = sign_message(message, config.secret)
+    if not isinstance(config.secret, str) or not config.secret:
+        print("Error: no shared secret configured")
+        return
+    message = sign_message(dict(message), config.secret)
 
     # Try TCP
     peer_ip = config.get_peer_ip(target)
@@ -1395,6 +1741,7 @@ def cli_status(socket_path):
         print(f"Tailscale: {resp.get('tailscale_ip')}:{resp.get('port')}")
         print()
         print(f"Inbox: {resp.get('inbox', 0)} unread")
+        print(f"Held: {resp.get('held', 0)}")
         for target, count in resp.get("outbox", {}).items():
             print(f"Outbox → {target}: {count} pending")
         print(f"Archive: {resp.get('archive', 0)} total")
@@ -1411,6 +1758,9 @@ def cli_status(socket_path):
         inbox = config.get_my_file_inbox()
         inbox_count = len(list(inbox.glob("*.json"))) if inbox and inbox.exists() else 0
         print(f"\nInbox: {inbox_count} unread")
+        held_dir = config.state_dir / "held"
+        held_count = len(list(held_dir.glob("*.json"))) if held_dir.exists() else 0
+        print(f"Held: {held_count}")
         for target in config.other_machines:
             ob = config.get_file_inbox(target)
             count = len(list(ob.glob("*.json"))) if ob and ob.exists() else 0
