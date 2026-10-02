@@ -726,7 +726,7 @@ def build_claude_cmd(claude_bin, model, budget, task, effort=None, fallback_mode
         cmd += ["--effort", effort]
     if fallback_model and fallback_model != model:
         cmd += ["--fallback-model", fallback_model]
-    return cmd + ["--max-budget-usd", str(budget), "-p", task]
+    return cmd + ["--max-budget-usd", str(budget), "-p", "--", task]
 
 
 class AutoExecutor:
