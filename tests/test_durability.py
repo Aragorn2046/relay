@@ -26,6 +26,16 @@ SPEC.loader.exec_module(relay)
 SECRET = "test-relay-secret"
 
 
+@pytest.fixture(autouse=True)
+def reset_directory_fsync_warning_flag():
+    previous = relay._UNSUPPORTED_DIRECTORY_FSYNC_LOGGED
+    relay._UNSUPPORTED_DIRECTORY_FSYNC_LOGGED = False
+    try:
+        yield
+    finally:
+        relay._UNSUPPORTED_DIRECTORY_FSYNC_LOGGED = previous
+
+
 class FakeConfig:
     def __init__(self, root, *, secret=SECRET, enabled=False):
         self.state_dir = Path(root) / "state"
@@ -321,6 +331,94 @@ def test_worker_start_retry_uses_backoff_and_logs_once_until_success(tmp_path):
         daemon.store.close()
 
 
+def test_stopping_before_execution_popen_requeues_row(tmp_path):
+    daemon = make_daemon(tmp_path, enabled=True)
+    try:
+        message = enqueue_message(daemon.store, "stopped-before-popen", auto=True)
+        original_run = daemon.executor._run
+
+        def stop_before_run(msg, on_done=None):
+            daemon.executor.stop_dispatching()
+            original_run(msg, on_done)
+
+        daemon.executor._run = stop_before_run
+        daemon._dispatch("stopped-before-popen")
+        assert daemon.executor.wait_for_workers(2) == []
+
+        row = daemon.store.get("stopped-before-popen")
+        assert row["state"] == "queued"
+        assert row["payload"] == message
+        assert daemon.executor.processes == {}
+    finally:
+        daemon.store.close()
+
+
+def test_dispatch_runtime_error_retries_then_holds_after_five_attempts(tmp_path):
+    daemon = make_daemon(tmp_path, enabled=True)
+    try:
+        enqueue_message(daemon.store, "dispatch-runtime-error", auto=True)
+        daemon.executor.execute = mock.Mock(side_effect=RuntimeError("executor bug"))
+
+        for attempt in range(5):
+            if attempt:
+                with daemon._retry_lock:
+                    daemon._worker_retry_after["dispatch-runtime-error"] = 0
+            daemon._dispatch("dispatch-runtime-error")
+
+        row = daemon.store.get("dispatch-runtime-error")
+        assert row["state"] == "held"
+        assert row["held_reason"] == "dispatch-error"
+        assert row["payload"]["body"] == "hello"
+        errors = [call for call in daemon.logger.error.call_args_list
+                  if "dispatch failed for dispatch-runtime-error" in str(call)]
+        assert len(errors) == 1
+        assert "dispatch-runtime-error" not in daemon._worker_start_attempts
+        assert "dispatch-runtime-error" not in daemon._worker_retry_after
+        assert "dispatch-runtime-error" not in daemon._worker_start_failure_logged
+    finally:
+        daemon.store.close()
+
+
+def test_operational_dispatch_exception_requeues_with_backoff(tmp_path):
+    daemon = make_daemon(tmp_path, enabled=True)
+    try:
+        message = enqueue_message(daemon.store, "dispatch-operational-error", auto=True)
+        daemon.executor.execute = mock.Mock(side_effect=sqlite3.OperationalError("database busy"))
+
+        daemon._dispatch("dispatch-operational-error")
+
+        row = daemon.store.get("dispatch-operational-error")
+        assert row["state"] == "queued"
+        assert row["payload"] == message
+        assert daemon._worker_start_attempts["dispatch-operational-error"] == 1
+        assert daemon._worker_retry_after["dispatch-operational-error"] >= time.monotonic() + 4.9
+    finally:
+        daemon.store.close()
+
+
+def test_pruning_clears_retry_bookkeeping_for_removed_rows(tmp_path):
+    daemon = make_daemon(tmp_path)
+    try:
+        enqueue_message(daemon.store, "pruned-retry")
+        assert daemon.store.set_state("pruned-retry", "done", expected_state="queued")
+        daemon._record_worker_start_failure("pruned-retry")
+        with daemon.store.lock:
+            daemon.store.connection.execute(
+                "UPDATE messages SET received_at = ? WHERE msg_id = ?",
+                (time.time() - relay.DEDUP_TTL - 1, "pruned-retry"),
+            )
+            daemon.store.connection.commit()
+
+        daemon._prune_store()
+
+        assert daemon.store.get("pruned-retry") is None
+        assert "pruned-retry" not in daemon._worker_start_attempts
+        assert "pruned-retry" not in daemon._worker_retry_after
+        assert "pruned-retry" not in daemon._worker_start_failure_logged
+    finally:
+        daemon.store.close()
+
+
 def test_shutdown_waits_for_worker_completion_callback(tmp_path):
     daemon = make_daemon(tmp_path, enabled=True)
     callback_started = threading.Event()
@@ -381,14 +479,223 @@ def test_killed_worker_stays_executing_for_startup_recovery(tmp_path, monkeypatc
         assert daemon.executor.wait_for_workers(0.01) == ["killed-worker"]
         daemon.executor.terminate_remaining_processes(grace_period=0)
         assert daemon.executor.wait_for_workers(None) == []
+        assert daemon.store.get("killed-worker")["payload"] == message
         assert daemon.store.get("killed-worker")["state"] == "executing"
 
         daemon._closing = False
         daemon.recover_interrupted()
         assert daemon.store.get("killed-worker")["state"] == "held"
+        assert daemon.store.get("killed-worker")["payload"] == message
         assert message["body"] == "hello"
     finally:
         daemon.store.close()
+
+
+def test_run_shutdown_releases_lock_with_live_stub_worker(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path, enabled=True, open_store=False)
+    daemon.config.tailscale_ip = "127.0.0.1"
+    worker_started = threading.Event()
+    child_stopped = threading.Event()
+    popen_kwargs = []
+
+    class FakeServer:
+        def close(self):
+            return None
+
+        async def wait_closed(self):
+            return None
+
+    class StubProcess:
+        pid = 424242
+
+        def __init__(self):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            worker_started.set()
+            if child_stopped.wait(timeout):
+                self.returncode = -relay.signal.SIGTERM
+                return "", ""
+            raise relay.subprocess.TimeoutExpired("stub-worker", timeout)
+
+        def wait(self, timeout=None):
+            if child_stopped.wait(timeout):
+                self.returncode = -relay.signal.SIGTERM
+                return self.returncode
+            raise relay.subprocess.TimeoutExpired("stub-worker", timeout)
+
+    async def fake_start_server(*_args, **_kwargs):
+        return FakeServer()
+
+    async def fake_start_unix_server(*_args, **kwargs):
+        Path(kwargs["path"]).touch()
+        return FakeServer()
+
+    async def launch_worker():
+        message = {
+            "msg_id": "shutdown-live-worker",
+            "from": "sender",
+            "body": "run",
+            "auto_execute": True,
+        }
+        daemon.store.enqueue(message["msg_id"], message, "test")
+        daemon._dispatch(message["msg_id"])
+        assert await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
+        daemon.shutdown_event.set()
+
+    async def idle_drain():
+        await asyncio.Event().wait()
+
+    def fake_popen(_cmd, **kwargs):
+        popen_kwargs.append(kwargs)
+        return StubProcess()
+
+    monkeypatch.setattr(relay.asyncio, "start_server", fake_start_server)
+    monkeypatch.setattr(relay.asyncio, "start_unix_server", fake_start_unix_server)
+    monkeypatch.setattr(daemon, "watch_file_inbox", launch_worker)
+    monkeypatch.setattr(daemon, "drain_queued", idle_drain)
+    monkeypatch.setattr(relay, "resolve_background_route", lambda *_args, **_kwargs: {
+        "rows": [("test-model", "")], "source": "test",
+    })
+    monkeypatch.setattr(relay, "pick_route_row", lambda *_args: ("test-model", "", None))
+    monkeypatch.setattr(relay.shutil, "which", lambda *_args, **_kwargs: "/usr/bin/claude")
+    monkeypatch.setattr(relay, "build_claude_cmd", lambda *_args, **_kwargs: ["stub-worker"])
+    monkeypatch.setattr(relay, "play_exec_alert", lambda _platform: None)
+    monkeypatch.setattr(relay.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(relay.os, "killpg", lambda _pid, _sig: child_stopped.set())
+
+    try:
+        started_at = time.monotonic()
+        asyncio.run(daemon.run())
+        elapsed = time.monotonic() - started_at
+
+        assert elapsed < 18
+        assert popen_kwargs and all(item.get("start_new_session") is True for item in popen_kwargs)
+        assert daemon.store is None
+        assert daemon._lock_fd is None
+        assert daemon.executor.wait_for_workers(0) == []
+
+        second = make_daemon(tmp_path, open_store=False)
+        assert second._acquire_instance_lock()
+        second._release_instance_lock()
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
+        daemon._release_instance_lock()
+
+
+def test_shutdown_persists_blocked_reply_and_startup_resends_once(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path, enabled=True)
+    message = {
+        "msg_id": "reply-pending-case",
+        "from": "sender",
+        "body": "hello",
+        "auto_execute": True,
+        "reply_to": "sender",
+    }
+    daemon.store.enqueue(message["msg_id"], message, "test")
+    reply_started = threading.Event()
+    reply_stopped = threading.Event()
+    popen_kwargs = []
+
+    class SuccessfulExecution:
+        pid = 434343
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return "child result", ""
+
+    class BlockingReply:
+        pid = 434344
+
+        def __init__(self):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            reply_started.set()
+            if reply_stopped.wait(timeout):
+                self.returncode = -relay.signal.SIGTERM
+                return "", ""
+            raise relay.subprocess.TimeoutExpired("stub-reply", timeout)
+
+        def wait(self, timeout=None):
+            if reply_stopped.wait(timeout):
+                self.returncode = -relay.signal.SIGTERM
+                return self.returncode
+            raise relay.subprocess.TimeoutExpired("stub-reply", timeout)
+
+    class SuccessfulReply:
+        pid = 434345
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return "sent", ""
+
+    def fake_popen(cmd, **kwargs):
+        popen_kwargs.append((cmd, kwargs))
+        if len(popen_kwargs) == 1:
+            return SuccessfulExecution()
+        return BlockingReply()
+
+    monkeypatch.setattr(relay, "resolve_background_route", lambda *_args, **_kwargs: {
+        "rows": [("test-model", "")], "source": "test",
+    })
+    monkeypatch.setattr(relay, "pick_route_row", lambda *_args: ("test-model", "", None))
+    monkeypatch.setattr(relay.shutil, "which", lambda *_args, **_kwargs: "/usr/bin/claude")
+    monkeypatch.setattr(relay, "build_claude_cmd", lambda *_args, **_kwargs: ["stub-execution"])
+    monkeypatch.setattr(relay, "play_exec_alert", lambda _platform: None)
+    monkeypatch.setattr(relay, "play_done_alert", lambda _platform: None)
+    monkeypatch.setattr(relay.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(relay.os, "killpg", lambda _pid, _sig: reply_stopped.set())
+
+    try:
+        daemon._dispatch(message["msg_id"])
+        assert reply_started.wait(timeout=2)
+        assert daemon.store.get(message["msg_id"])["state"] == "done"
+
+        daemon.executor.stop_dispatching()
+        daemon.executor.terminate_remaining_processes(grace_period=0, reap_timeout=1)
+        assert daemon.executor.wait_for_workers(2) == []
+
+        pending_path = daemon.config.state_dir / "held" / "reply-pending-case.reply-pending.json"
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        assert pending["result"] == "child result"
+        assert pending["success"] is True
+        assert set(pending) == {"msg_id", "from", "result", "success"}
+        assert all(kwargs.get("start_new_session") is True for _cmd, kwargs in popen_kwargs)
+        daemon.store.close()
+
+        retry_daemon = make_daemon(tmp_path, open_store=False)
+        retried_commands = []
+
+        def successful_popen(cmd, **kwargs):
+            retried_commands.append((cmd, kwargs))
+            return SuccessfulReply()
+
+        monkeypatch.setattr(relay.subprocess, "Popen", successful_popen)
+        asyncio.run(retry_daemon.run())
+
+        assert len(retried_commands) == 1
+        assert "send" in retried_commands[0][0]
+        assert "child result" in retried_commands[0][0][-1]
+        assert retried_commands[0][1]["start_new_session"] is True
+        assert not pending_path.exists()
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
+        daemon._release_instance_lock()
 
 
 @pytest.mark.parametrize("body", [None, 7])
@@ -571,6 +878,39 @@ def test_legacy_held_rows_migrate_as_already_picked_up(tmp_path, has_file):
         daemon.store.close()
 
 
+def test_user_version_one_migrates_existing_held_written_column(tmp_path):
+    daemon = make_daemon(tmp_path, open_store=False)
+    state_dir = daemon.config.state_dir
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = state_dir / "relay-state.sqlite3"
+    connection = sqlite3.connect(db_path)
+    connection.execute("""CREATE TABLE messages (
+        msg_id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        state TEXT NOT NULL,
+        received_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        payload TEXT,
+        held_written INTEGER NOT NULL DEFAULT 0,
+        held_reason TEXT
+    )""")
+    connection.execute(
+        "INSERT INTO messages VALUES (?, ?, 'held', ?, ?, ?, 0, ?)",
+        ("version-one-held", "test", time.time(), time.time(), json.dumps({"body": "hello"}), "manual"),
+    )
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+
+    daemon.store = relay.RelayStore(state_dir, logger=daemon.logger)
+    daemon.executor.store = daemon.store
+    try:
+        assert daemon.store.get("version-one-held")["held_written"] == 1
+        assert daemon.store.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    finally:
+        daemon.store.close()
+
+
 def test_directory_fsync_einval_is_accepted_for_inbox_and_held_files(tmp_path, monkeypatch):
     daemon = make_daemon(tmp_path)
     original_fsync = os.fsync
@@ -594,8 +934,33 @@ def test_directory_fsync_einval_is_accepted_for_inbox_and_held_files(tmp_path, m
         with mock.patch.object(relay.os, "fsync", side_effect=reject_directory_fsync):
             daemon._hold_message("held-einval", {"body": "hello"}, "manual")
         assert daemon.store.get("held-einval")["held_written"] == 1
+        fsync_warnings = [call for call in daemon.logger.warning.call_args_list
+                          if "Directory fsync is unsupported" in str(call)]
+        assert len(fsync_warnings) == 1
     finally:
         daemon.store.close()
+
+
+@pytest.mark.parametrize(
+    "unsupported_errno",
+    sorted({relay.errno.EINVAL, relay.errno.ENOTSUP, relay.errno.EOPNOTSUPP}),
+)
+def test_directory_fsync_only_accepts_documented_unsupported_errnos(tmp_path, unsupported_errno):
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    original_fsync = os.fsync
+
+    def reject_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(unsupported_errno, "directory fsync unsupported")
+        return original_fsync(fd)
+
+    with mock.patch.object(relay.os, "fsync", side_effect=reject_directory):
+        relay._fsync_directory(directory, logger=mock.Mock())
+
+    with mock.patch.object(relay.os, "open", side_effect=OSError(relay.errno.EINVAL, "open failed")):
+        with pytest.raises(OSError, match="open failed"):
+            relay._fsync_directory(directory, logger=mock.Mock())
 
 
 def test_held_directory_fsync_eio_keeps_row_unwritten_until_retry(tmp_path):
