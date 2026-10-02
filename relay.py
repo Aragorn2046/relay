@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 DEFAULT_PORT = 7272
 MAX_MESSAGE_SIZE = 1_048_576  # 1 MB
 HMAC_MAX_AGE = 300.0  # 5 minutes
@@ -58,6 +58,16 @@ TCP_READ_TIMEOUT = 5.0
 EXECUTION_TIMEOUT = 300  # 5 minutes
 FILE_DECODE_GRACE = 30.0
 WORKER_START_FAILED = object()
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset({
+    errno.EINVAL,
+    errno.ENOTSUP,
+    errno.EOPNOTSUPP,
+    errno.EBADF,
+    errno.EISDIR,
+    errno.EPERM,
+})
+_UNSUPPORTED_DIRECTORY_FSYNC_LOGGED = False
+_UNSUPPORTED_DIRECTORY_FSYNC_LOCK = threading.Lock()
 
 assert DEDUP_TTL >= 2 * HMAC_MAX_AGE, "dedup TTL must cover the full HMAC replay window"
 
@@ -351,13 +361,27 @@ def frame_and_encode(msg_dict):
     return frame_message(payload)
 
 
-def _fsync_directory(path):
+def _fsync_directory(path, logger=None):
+    """Sync directory metadata, accepting filesystems that do not support it."""
+    global _UNSUPPORTED_DIRECTORY_FSYNC_LOGGED
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    fd = os.open(path, flags)
+    fd = None
     try:
+        fd = os.open(path, flags)
         os.fsync(fd)
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            raise
+        with _UNSUPPORTED_DIRECTORY_FSYNC_LOCK:
+            should_log = not _UNSUPPORTED_DIRECTORY_FSYNC_LOGGED
+            _UNSUPPORTED_DIRECTORY_FSYNC_LOGGED = True
+        if should_log:
+            (logger or logging.getLogger("relay")).debug(
+                "Directory fsync is unsupported for %s: %s", path, exc
+            )
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
 
 
 # ── Durable message state and deduplication ──
@@ -366,9 +390,9 @@ class RelayStore:
     """SQLite-backed queue and replay store shared by the event loop and workers."""
 
     STATES = frozenset({"queued", "executing", "done", "failed", "held"})
-
-    def __init__(self, state_dir):
+    def __init__(self, state_dir, logger=None):
         self.state_dir = Path(state_dir).expanduser()
+        self.logger = logger or logging.getLogger("relay")
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.state_dir, 0o700)
         self.path = self.state_dir / "relay-state.sqlite3"
@@ -392,6 +416,7 @@ class RelayStore:
                 held_reason TEXT
             )""")
             columns = {row[1] for row in self.connection.execute("PRAGMA table_info(messages)")}
+            added_held_written = "held_written" not in columns
             if "held_written" not in columns:
                 self.connection.execute(
                     "ALTER TABLE messages ADD COLUMN held_written INTEGER NOT NULL DEFAULT 0"
@@ -402,8 +427,27 @@ class RelayStore:
                 "CREATE INDEX IF NOT EXISTS idx_messages_state_received "
                 "ON messages(state, received_at)"
             )
+            missing_legacy_files = []
+            if added_held_written:
+                legacy_held = self.connection.execute(
+                    "SELECT msg_id FROM messages WHERE state = 'held' AND held_written = 0"
+                ).fetchall()
+                missing_legacy_files = [
+                    row["msg_id"]
+                    for row in legacy_held
+                    if not (self.state_dir / "held" / f"{row['msg_id']}.json").is_file()
+                ]
+                self.connection.execute(
+                    "UPDATE messages SET held_written = 1 "
+                    "WHERE state = 'held' AND held_written = 0"
+                )
             self.connection.commit()
             self._secure_modes()
+            if missing_legacy_files:
+                self.logger.warning(
+                    "Legacy held messages without pickup files treated as picked up: %s",
+                    ", ".join(missing_legacy_files),
+                )
 
     def _secure_modes(self):
         for path in (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
@@ -495,6 +539,15 @@ class RelayStore:
             ).fetchall()
             return [self._decode_row(row) for row in rows]
 
+    def list_unwritten_held(self):
+        """Load only held rows whose pickup file still needs to be written."""
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT * FROM messages WHERE state = 'held' AND held_written = 0 "
+                "ORDER BY received_at ASC, msg_id ASC"
+            ).fetchall()
+            return [self._decode_row(row) for row in rows]
+
     def counts(self):
         with self.lock:
             rows = self.connection.execute("SELECT state, COUNT(*) AS count FROM messages GROUP BY state").fetchall()
@@ -514,23 +567,17 @@ class RelayStore:
             (cutoff,),
         )
         held_rows = self.connection.execute(
-            "SELECT msg_id, held_written FROM messages "
-            "WHERE state = 'held' AND received_at < ? ORDER BY received_at ASC",
+            "SELECT msg_id FROM messages "
+            "WHERE state = 'held' AND held_written = 1 AND received_at < ? "
+            "ORDER BY received_at ASC",
             (cutoff,),
         ).fetchall()
         for row in held_rows:
-            held_path = self.state_dir / "held" / f"{row['msg_id']}.json"
-            if row["held_written"] and held_path.is_file():
-                self.connection.execute(
-                    "DELETE FROM messages WHERE msg_id = ? AND state = 'held' "
-                    "AND received_at < ? AND held_written = 1",
-                    (row["msg_id"], cutoff),
-                )
-            elif row["held_written"]:
-                self.connection.execute(
-                    "UPDATE messages SET held_written = 0 WHERE msg_id = ? AND state = 'held'",
-                    (row["msg_id"],),
-                )
+            self.connection.execute(
+                "DELETE FROM messages WHERE msg_id = ? AND state = 'held' "
+                "AND received_at < ? AND held_written = 1",
+                (row["msg_id"], cutoff),
+            )
 
     def _decode_row(self, row):
         if row is None:
@@ -644,7 +691,7 @@ def _session_route_helper():
     return str(home / "42" / "Config" / "scripts" / "session-route.py")
 
 
-def resolve_background_route(logger=None, timeout=ROUTE_TIMEOUT):
+def resolve_background_route(logger=None, timeout=ROUTE_TIMEOUT, process_runner=None):
     """The registry's background-claude card as {rows: [(model, effort)...], source}.
 
     Raises RouteRefused when the card refuses (helper exit 3), when it has no
@@ -654,12 +701,15 @@ def resolve_background_route(logger=None, timeout=ROUTE_TIMEOUT):
     """
     helper = _session_route_helper()
     try:
-        proc = subprocess.run(
+        runner = process_runner or subprocess.run
+        proc = runner(
             [sys.executable, helper, "--consumer", ROUTE_CONSUMER, "--json", "--timeout", str(timeout)],
             capture_output=True, text=True, errors="replace", timeout=timeout + 15, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RouteRefused(f"session-route did not answer: {type(exc).__name__}: {exc}") from exc
+    if proc is None:
+        raise RouteRefused("session-route was not started during shutdown")
     try:
         payload = json.loads(proc.stdout)
     except (ValueError, TypeError):
@@ -737,10 +787,13 @@ class AutoExecutor:
         self.active = 0
         self.lock = threading.Lock()
         self.workers = {}
+        self.processes = {}
+        self._stopping = False
+        self._shutdown_killed = set()
 
     def can_accept(self):
         with self.lock:
-            return self.active < self.config.max_concurrent
+            return not self._stopping and self.active < self.config.max_concurrent
 
     def _is_admitted(self, msg):
         if self.store is None:
@@ -758,37 +811,134 @@ class AutoExecutor:
             self.logger.error("AUTO-EXEC refused: message is not durably admitted as executing")
             return False
         with self.lock:
+            if self._stopping:
+                return False
             if self.active >= self.config.max_concurrent:
                 return False
             self.active += 1
-        worker = None
-        try:
-            worker = threading.Thread(target=self._run, args=(msg, on_done), daemon=True)
-            with self.lock:
+            worker = None
+            start_error = None
+            try:
+                worker = threading.Thread(target=self._run, args=(msg, on_done), daemon=True)
                 self.workers[worker] = msg.get("msg_id", "(unknown)")
-            worker.start()
-            return True
-        except Exception as exc:
-            with self.lock:
+                worker.start()
+                return True
+            except Exception as exc:
+                start_error = exc
                 self.active -= 1
                 if worker is not None:
                     self.workers.pop(worker, None)
+        try:
+            self.logger.debug(f"AUTO-EXEC could not start worker: {start_error}")
+        except Exception:
+            pass
+        return WORKER_START_FAILED
+
+    def stop_dispatching(self):
+        """Prevent new worker threads and execution subprocesses from starting."""
+        with self.lock:
+            self._stopping = True
+
+    def _start_worker_process(self, cmd, **kwargs):
+        worker = threading.current_thread()
+        with self.lock:
+            if self._stopping:
+                return None
+            process = subprocess.Popen(cmd, **kwargs)
+            self.processes[worker] = process
+            return process
+
+    def _run_worker_process(self, cmd, **kwargs):
+        timeout = kwargs.pop("timeout", None)
+        kwargs.pop("check", None)
+        if kwargs.pop("capture_output", False):
+            kwargs.setdefault("stdout", subprocess.PIPE)
+            kwargs.setdefault("stderr", subprocess.PIPE)
+        worker = threading.current_thread()
+        process = self._start_worker_process(cmd, **kwargs)
+        if process is None:
+            return None
+        try:
             try:
-                self.logger.error(f"AUTO-EXEC could not start worker: {exc}")
-            except Exception:
-                pass
-            return WORKER_START_FAILED
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                stdout, stderr = process.communicate()
+                raise subprocess.TimeoutExpired(
+                    cmd,
+                    timeout,
+                    output=stdout if stdout is not None else exc.output,
+                    stderr=stderr if stderr is not None else exc.stderr,
+                ) from exc
+        finally:
+            self._forget_worker_process(worker, process)
+        return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+    def _forget_worker_process(self, worker, process):
+        with self.lock:
+            if self.processes.get(worker) is process:
+                self.processes.pop(worker, None)
+
+    def _worker_was_shutdown_killed(self, worker=None):
+        worker = worker or threading.current_thread()
+        with self.lock:
+            return worker in self._shutdown_killed
 
     def wait_for_workers(self, timeout):
         """Join active workers for at most timeout seconds and return their IDs."""
-        deadline = time.monotonic() + max(0.0, timeout)
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         with self.lock:
             workers = list(self.workers.items())
         for worker, _msg_id in workers:
-            remaining = max(0.0, deadline - time.monotonic())
-            worker.join(remaining)
+            if deadline is None:
+                worker.join()
+            else:
+                remaining = max(0.0, deadline - time.monotonic())
+                worker.join(remaining)
         with self.lock:
             return [msg_id for worker, msg_id in self.workers.items() if worker.is_alive()]
+
+    def terminate_remaining_processes(self, grace_period=5.0):
+        """Terminate and reap worker subprocesses that outlive graceful shutdown."""
+        with self.lock:
+            processes = list(self.processes.items())
+
+        terminating = []
+        for worker, process in processes:
+            if process.poll() is not None:
+                continue
+            with self.lock:
+                still_registered = self.processes.get(worker) is process
+                if still_registered and process.poll() is None:
+                    self._shutdown_killed.add(worker)
+                else:
+                    still_registered = False
+            if not still_registered:
+                continue
+            try:
+                process.terminate()
+            except OSError:
+                pass
+            terminating.append(process)
+
+        deadline = time.monotonic() + max(0.0, grace_period)
+        for process in terminating:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                pass
+
+        for process in terminating:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            process.wait()
 
     def _call_on_done(self, on_done, success):
         if on_done is None:
@@ -803,10 +953,15 @@ class AutoExecutor:
 
     def _run(self, msg, on_done=None):
         success = False
+        completion_allowed = True
+        worker = threading.current_thread()
         task = ""
         budget = 0.0
         model = "(unknown)"
         try:
+            if self._is_stopping():
+                completion_allowed = False
+                return
             if self.store is not None and getattr(self.config, "auto_execute_enabled", False) is not True:
                 self.logger.warning("AUTO-EXEC disabled (auto_execute.enabled is not true): refusing execution")
                 return
@@ -819,13 +974,18 @@ class AutoExecutor:
             # The registry always decides; a message may only pick one of the card's rows.
             try:
                 try:
-                    route = resolve_background_route(self.logger)
+                    route = resolve_background_route(
+                        self.logger, process_runner=self._run_worker_process
+                    )
                     model, effort, fallback_model = pick_route_row(route, explicit_model)
                 except RouteRefused:
                     raise
                 except Exception as exc:  # never wedge auto-exec on an unexpected answer
                     raise RouteRefused(f"route could not be read: {type(exc).__name__}: {exc}") from exc
             except RouteRefused as exc:
+                if self._is_stopping() or self._worker_was_shutdown_killed(worker):
+                    completion_allowed = False
+                    return
                 reason = f"REFUSED: the Model Routing registry route for {ROUTE_CONSUMER} cannot run: {exc}"
                 try:
                     self.logger.error(f"AUTO-EXEC {reason} (task: {task[:80]})")
@@ -844,7 +1004,13 @@ class AutoExecutor:
             sender = msg.get("from", "unknown")
             self.logger.info(f"AUTO-EXEC from {sender}: {task[:120]} (model={model}, effort={effort or '-'}, "
                              f"route={route_note}, budget=${budget})")
+            if self._is_stopping():
+                completion_allowed = False
+                return
             play_exec_alert(self.config.platform)
+            if self._is_stopping():
+                completion_allowed = False
+                return
 
             start = time.time()
             result = ""
@@ -871,17 +1037,32 @@ class AutoExecutor:
                 if not Path(cwd).exists():
                     cwd = str(home)
 
-                proc = subprocess.run(
-                    cmd, capture_output=True, text=True,
-                    timeout=self.config.exec_timeout, cwd=cwd, env=env
+                proc = self._start_worker_process(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    cwd=cwd, env=env
                 )
-                result = proc.stdout or ""
-                if proc.returncode == 0:
-                    success = True
-                else:
-                    result += f"\nSTDERR: {proc.stderr or '(none)'}"
-            except subprocess.TimeoutExpired:
-                result = f"TIMEOUT after {self.config.exec_timeout}s"
+                if proc is None:
+                    completion_allowed = False
+                    return
+                timed_out = False
+                try:
+                    stdout, stderr = proc.communicate(timeout=self.config.exec_timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    proc.kill()
+                    proc.communicate()
+                    result = f"TIMEOUT after {self.config.exec_timeout}s"
+                finally:
+                    self._forget_worker_process(worker, proc)
+                if self._worker_was_shutdown_killed(worker):
+                    completion_allowed = False
+                    return
+                if not timed_out:
+                    result = stdout or ""
+                    if proc.returncode == 0:
+                        success = True
+                    else:
+                        result += f"\nSTDERR: {stderr or '(none)'}"
             except FileNotFoundError as exc:
                 result = f"CLAUDE BINARY NOT FOUND: {exc}"
                 self.logger.error(f"AUTO-EXEC PATH failure: {exc}")
@@ -895,25 +1076,33 @@ class AutoExecutor:
                 self._log_to_vault(task, result, success, duration, model, budget)
             except Exception as exc:
                 self.logger.warning(f"Failed to report execution: {exc}")
-            if msg.get("reply_to"):
+            if msg.get("reply_to") and not self._is_stopping():
                 try:
                     self._send_result_back(msg, result, success)
                 except Exception as exc:
                     self.logger.warning(f"Failed to relay result back: {exc}")
-            try:
-                play_done_alert(self.config.platform)
-            except Exception as exc:
-                self.logger.warning(f"AUTO-EXEC completion alert failed: {exc}")
+            if not self._is_stopping():
+                try:
+                    play_done_alert(self.config.platform)
+                except Exception as exc:
+                    self.logger.warning(f"AUTO-EXEC completion alert failed: {exc}")
         except Exception as exc:
             try:
                 self.logger.error(f"AUTO-EXEC unexpected failure: {type(exc).__name__}: {exc}")
             except Exception:
                 pass
         finally:
+            if completion_allowed and not self._worker_was_shutdown_killed(worker):
+                self._call_on_done(on_done, success)
             with self.lock:
                 self.active = max(0, self.active - 1)
-                self.workers.pop(threading.current_thread(), None)
-            self._call_on_done(on_done, success)
+                self.workers.pop(worker, None)
+                self.processes.pop(worker, None)
+                self._shutdown_killed.discard(worker)
+
+    def _is_stopping(self):
+        with self.lock:
+            return self._stopping
 
     def _log_to_vault(self, task, result, success, duration, model, budget):
         try:
@@ -939,10 +1128,21 @@ class AutoExecutor:
                 return
             status = "completed" if success else "failed"
             reply = f"[AUTO-RESULT: {status}] Re: {original_msg.get('body', original_msg.get('message', ''))[:100]}\n\n{result[:1500]}"
-            subprocess.run(
+            worker = threading.current_thread()
+            process = self._start_worker_process(
                 [sys.executable, __file__, "send", sender, reply],
-                capture_output=True, timeout=30
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
+            if process is None:
+                return
+            try:
+                process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            finally:
+                self._forget_worker_process(worker, process)
         except Exception as e:
             self.logger.warning(f"Failed to relay result back: {e}")
 
@@ -963,6 +1163,9 @@ class RelayDaemon:
         self.stats = {"tcp_received": 0, "tcp_sent": 0, "file_received": 0, "file_sent": 0}
         self._queue_logged = set()
         self._store_full_logged = False
+        self._worker_start_attempts = {}
+        self._worker_retry_after = {}
+        self._worker_start_failure_logged = set()
         self._lock_fd = None
         self._closing = False
         self._lifecycle_lock = threading.Lock()
@@ -1014,6 +1217,31 @@ class RelayDaemon:
         if not self._store_full_logged:
             self.logger.error(f"Relay store is full; refusing new messages: {exc}")
             self._store_full_logged = True
+
+    def _worker_retry_is_pending(self, msg_id):
+        retry_at = self._worker_retry_after.get(msg_id)
+        if retry_at is None:
+            return False
+        if time.monotonic() < retry_at:
+            return True
+        self._worker_retry_after.pop(msg_id, None)
+        return False
+
+    def _record_worker_start_failure(self, msg_id):
+        attempts = self._worker_start_attempts.get(msg_id, 0)
+        delay = min(5.0 * (2 ** attempts), 300.0)
+        self._worker_start_attempts[msg_id] = attempts + 1
+        self._worker_retry_after[msg_id] = time.monotonic() + delay
+        if msg_id not in self._worker_start_failure_logged:
+            self.logger.error(
+                f"AUTO-EXEC worker could not start for {msg_id}; retrying in {delay:.0f}s"
+            )
+            self._worker_start_failure_logged.add(msg_id)
+
+    def _clear_worker_start_failure(self, msg_id):
+        self._worker_start_attempts.pop(msg_id, None)
+        self._worker_retry_after.pop(msg_id, None)
+        self._worker_start_failure_logged.discard(msg_id)
 
     # ── TCP Server ──
 
@@ -1098,6 +1326,8 @@ class RelayDaemon:
                 await writer.wait_closed()
                 return
 
+            self._store_full_logged = False
+
             resp = {"status": "ok", "msg_id": msg_id}
             writer.write(frame_and_encode(resp))
             await writer.drain()
@@ -1122,7 +1352,6 @@ class RelayDaemon:
 
     def _write_held_file(self, msg_id, message, reason):
         held_dir = self.config.state_dir / "held"
-        existed = held_dir.exists()
         held_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(held_dir, 0o700)
         held_path = held_dir / f"{msg_id}.json"
@@ -1137,9 +1366,8 @@ class RelayDaemon:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(tmp_path, held_path)
-            _fsync_directory(held_dir)
-            if not existed:
-                _fsync_directory(self.config.state_dir)
+            _fsync_directory(held_dir, logger=self.logger)
+            _fsync_directory(self.config.state_dir, logger=self.logger)
         finally:
             try:
                 tmp_path.unlink()
@@ -1176,11 +1404,8 @@ class RelayDaemon:
         return True
 
     def _ensure_held_files(self):
-        for row in self.store.list_state("held"):
+        for row in self.store.list_unwritten_held():
             msg_id = row["msg_id"]
-            held_path = self.config.state_dir / "held" / f"{msg_id}.json"
-            if row.get("held_written") and held_path.is_file():
-                continue
             payload = row.get("payload")
             if payload is None:
                 self.logger.error(f"Held message {msg_id} has no DB payload for file recovery")
@@ -1206,17 +1431,26 @@ class RelayDaemon:
 
     def _dispatch(self, msg_id):
         """Dispatch one durably queued message, or leave it queued for the drain."""
+        if self._closing:
+            return
         row = self.store.get(msg_id)
         if not row or row["state"] != "queued":
             return
         message = row.get("payload") or {}
-        validate_inbound_message(message)
+        try:
+            validate_inbound_message(message)
+        except (ValueError, TypeError) as exc:
+            self.logger.error(f"Dispatch rejected invalid message {msg_id}: {exc}")
+            self._hold_message(msg_id, message, "dispatch-error", expected_state="queued")
+            self._queue_logged.discard(msg_id)
+            return
         if not self._is_auto_message(message):
             sender = message.get("from", "unknown")
             body = message.get("body", message.get("message", "(empty)"))
             play_alert(self.config.platform)
             self.logger.info(f"Message from {sender}: {body[:200]}")
             self.store.set_state(msg_id, "done", expected_state="queued")
+            self._clear_worker_start_failure(msg_id)
             return
 
         if getattr(self.config, "auto_execute_enabled", False) is not True:
@@ -1233,6 +1467,9 @@ class RelayDaemon:
                                expected_state="queued")
             return
 
+        if self._worker_retry_is_pending(msg_id):
+            return
+
         if not self.executor.can_accept():
             if msg_id not in self._queue_logged:
                 body = message.get("body", message.get("message", ""))
@@ -1245,23 +1482,27 @@ class RelayDaemon:
 
         def on_done(success):
             with self._lifecycle_lock:
-                if self._closing:
-                    return
                 if self.store.set_state(msg_id, "done" if success else "failed",
                                         expected_state="executing"):
                     self._queue_logged.discard(msg_id)
+                    self._clear_worker_start_failure(msg_id)
 
         try:
             result = self.executor.execute(message, on_done=on_done)
-            if result is WORKER_START_FAILED or not result:
+            if result is WORKER_START_FAILED:
                 if self.store.set_state(msg_id, "queued", expected_state="executing"):
                     self._queue_logged.discard(msg_id)
+                    self._record_worker_start_failure(msg_id)
+            elif not result:
+                self.store.set_state(msg_id, "queued", expected_state="executing")
+            else:
+                self._clear_worker_start_failure(msg_id)
         except Exception as exc:
-            self.logger.error(f"Could not start queued execution {msg_id}: {exc}")
-            current = self.store.get(msg_id)
-            if current and current["state"] == "executing":
-                self._hold_message(msg_id, current.get("payload") or {}, "dispatch-error",
-                                   expected_state="executing")
+            self.logger.error(f"Could not start queued execution {msg_id}; leaving it for retry: {exc}")
+            try:
+                self.store.set_state(msg_id, "queued", expected_state="executing")
+            except (sqlite3.OperationalError, OSError) as state_exc:
+                self.logger.warning(f"Could not requeue {msg_id} after dispatch failure: {state_exc}")
 
     async def drain_queued(self):
         last_prune = 0.0
@@ -1271,16 +1512,12 @@ class RelayDaemon:
                 for row in self.store.list_state("queued"):
                     try:
                         self._dispatch(row["msg_id"])
+                    except (sqlite3.OperationalError, OSError) as exc:
+                        self.logger.warning(
+                            f"Dispatch temporarily failed for {row['msg_id']}; leaving it queued: {exc}"
+                        )
                     except Exception as exc:
                         self.logger.error(f"Dispatch failed for {row['msg_id']}: {exc}")
-                        current = self.store.get(row["msg_id"])
-                        if current and current["state"] in ("queued", "executing"):
-                            try:
-                                self._hold_message(row["msg_id"], current.get("payload"),
-                                                   "dispatch-error", expected_state=current["state"])
-                            except Exception as hold_exc:
-                                self.logger.error(f"Could not hold dispatch failure {row['msg_id']}: {hold_exc}")
-                        self._queue_logged.discard(row["msg_id"])
                 now = time.monotonic()
                 if now - last_prune >= 60.0:
                     self.store.prune()
@@ -1320,6 +1557,8 @@ class RelayDaemon:
                 result = await self._send_to_target(target, message)
                 status = "error" if result.get("method") == "error" else "ok"
                 resp = {"status": status, "delivery": result}
+                if status == "error":
+                    resp["error"] = result.get("error", "delivery failed")
             elif cmd == "check":
                 resp = self._check_file_inbox()
             elif cmd == "read":
@@ -1415,7 +1654,7 @@ class RelayDaemon:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(tmp_path, filepath)
-            _fsync_directory(inbox_path)
+            _fsync_directory(inbox_path, logger=self.logger)
         finally:
             try:
                 tmp_path.unlink()
@@ -1545,6 +1784,8 @@ class RelayDaemon:
                 self.logger.error(f"Failed to durably enqueue file message {msg_path.name}: {exc}")
             return "retry"
 
+        if is_new:
+            self._store_full_logged = False
         self._archive_file(msg_path)
         if is_new:
             self.stats["file_received"] += 1
@@ -1584,7 +1825,7 @@ class RelayDaemon:
                 if target.exists():
                     target = rejected / f"{msg_path.stem}-{uuid.uuid4().hex}{msg_path.suffix}"
                 msg_path.rename(target)
-            _fsync_directory(rejected)
+            _fsync_directory(rejected, logger=self.logger)
         except OSError:
             # The watcher's seen set prevents repeated logs while the source remains.
             pass
@@ -1699,7 +1940,7 @@ class RelayDaemon:
         sock_path = Path(self.config.socket_path)
         owns_socket = False
         try:
-            self.store = RelayStore(self.config.state_dir)
+            self.store = RelayStore(self.config.state_dir, logger=self.logger)
             self.executor.store = self.store
             enabled = getattr(self.config, "auto_execute_enabled", False) is True
             self.logger.info(f"Effective auto_execute.enabled={enabled}")
@@ -1743,6 +1984,9 @@ class RelayDaemon:
             await self.shutdown_event.wait()
         finally:
             self.logger.info("Shutting down...")
+            with self._lifecycle_lock:
+                self._closing = True
+            self.executor.stop_dispatching()
             for server in (tcp_server, uds_server):
                 if server is not None:
                     server.close()
@@ -1755,22 +1999,19 @@ class RelayDaemon:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-            try:
-                timeout = min(max(0.0, float(self.config.exec_timeout)), 30.0)
-            except (AttributeError, TypeError, ValueError):
-                timeout = min(EXECUTION_TIMEOUT, 30.0)
-            in_flight = self.executor.wait_for_workers(timeout)
+            in_flight = self.executor.wait_for_workers(15.0)
             if in_flight:
                 self.logger.error(f"AUTO-EXEC workers still in flight at shutdown: {', '.join(in_flight)}")
+                self.executor.terminate_remaining_processes(grace_period=5.0)
+                self.executor.wait_for_workers(None)
 
             try:
-                with self._lifecycle_lock:
-                    self._closing = True
-                    if owns_socket and sock_path.exists():
-                        sock_path.unlink()
-                    if self.store is not None:
-                        self.store.close()
-                        self.store = None
+                if owns_socket and sock_path.exists():
+                    sock_path.unlink()
+                if self.store is not None:
+                    self.store.close()
+                    self.store = None
+                    self.executor.store = None
             finally:
                 self._release_instance_lock()
             self.logger.info("Shutdown complete")

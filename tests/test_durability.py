@@ -6,7 +6,10 @@ import json
 import os
 import re
 import socket
+import sqlite3
+import stat
 import struct
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -143,6 +146,24 @@ def test_signed_replay_is_deduped_after_restart(tmp_path):
         restarted.close()
 
 
+def test_store_full_log_flag_resets_after_successful_tcp_enqueue(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path)
+    try:
+        daemon._store_full_logged = True
+        monkeypatch.setattr(relay, "play_alert", lambda _platform: None)
+        message = signed_message()
+        writer = FakeWriter()
+
+        asyncio.run(daemon.handle_tcp_client(
+            FakeReader(relay.frame_message(json.dumps(message).encode("utf-8"))), writer
+        ))
+
+        assert decode_response(writer)["status"] == "ok"
+        assert daemon._store_full_logged is False
+    finally:
+        daemon.store.close()
+
+
 def test_interrupted_execution_is_held_and_not_restarted(tmp_path):
     daemon = make_daemon(tmp_path, enabled=True)
     try:
@@ -229,6 +250,30 @@ def test_tcp_and_uds_return_error_without_ack_when_enqueue_raises(tmp_path):
     daemon.store.close()
 
 
+def test_uds_send_error_is_returned_as_error_response(tmp_path):
+    daemon = make_daemon(tmp_path)
+    try:
+        async def send_error(_target, _message):
+            return {"method": "error", "error": "no delivery path"}
+
+        daemon._send_to_target = send_error
+        writer = FakeWriter()
+        request = relay.frame_and_encode({
+            "cmd": "send",
+            "target": "peer",
+            "message": {"body": "hello"},
+        })
+
+        asyncio.run(daemon.handle_uds_client(FakeReader(request), writer))
+
+        response = decode_response(writer)
+        assert response["status"] == "error"
+        assert response["error"] == "no delivery path"
+        assert response["delivery"]["method"] == "error"
+    finally:
+        daemon.store.close()
+
+
 def test_worker_start_failure_requeues_with_payload_intact(tmp_path):
     daemon = make_daemon(tmp_path, enabled=True)
     try:
@@ -241,6 +286,107 @@ def test_worker_start_failure_requeues_with_payload_intact(tmp_path):
         assert row["payload"] == message
         assert daemon.executor.active == 0
         assert daemon.executor.workers == {}
+        assert daemon._worker_start_attempts["start-failure"] == 1
+        assert daemon._worker_retry_after["start-failure"] >= time.monotonic() + 4.9
+    finally:
+        daemon.store.close()
+
+
+def test_worker_start_retry_uses_backoff_and_logs_once_until_success(tmp_path):
+    daemon = make_daemon(tmp_path, enabled=True)
+    try:
+        enqueue_message(daemon.store, "retry-backoff", auto=True)
+        with mock.patch.object(relay.threading.Thread, "start", side_effect=RuntimeError("cannot start")):
+            daemon._dispatch("retry-backoff")
+        first_retry = daemon._worker_retry_after["retry-backoff"]
+        assert first_retry >= time.monotonic() + 4.8
+
+        daemon._worker_retry_after["retry-backoff"] = 0
+        with mock.patch.object(relay.threading.Thread, "start", side_effect=RuntimeError("still cannot start")):
+            daemon._dispatch("retry-backoff")
+        assert daemon._worker_start_attempts["retry-backoff"] == 2
+        assert daemon._worker_retry_after["retry-backoff"] >= time.monotonic() + 9.8
+        failure_logs = [call for call in daemon.logger.error.call_args_list
+                        if "worker could not start for retry-backoff" in str(call)]
+        assert len(failure_logs) == 1
+
+        daemon._worker_retry_after["retry-backoff"] = 0
+        daemon.executor.execute = mock.Mock(return_value=True)
+        daemon._dispatch("retry-backoff")
+        assert daemon.store.get("retry-backoff")["state"] == "executing"
+        assert "retry-backoff" not in daemon._worker_retry_after
+        assert "retry-backoff" not in daemon._worker_start_attempts
+        assert "retry-backoff" not in daemon._worker_start_failure_logged
+    finally:
+        daemon.store.close()
+
+
+def test_shutdown_waits_for_worker_completion_callback(tmp_path):
+    daemon = make_daemon(tmp_path, enabled=True)
+    callback_started = threading.Event()
+    finish_callback = threading.Event()
+
+    def finish_worker(_message, on_done):
+        callback_started.set()
+        finish_callback.wait(timeout=2)
+        on_done(True)
+
+    try:
+        enqueue_message(daemon.store, "finishing", auto=True)
+        daemon.executor._run = finish_worker
+        daemon._dispatch("finishing")
+        assert callback_started.wait(timeout=1)
+
+        daemon._closing = True
+        daemon.executor.stop_dispatching()
+        assert daemon.executor.wait_for_workers(0) == ["finishing"]
+
+        finish_callback.set()
+        assert daemon.executor.wait_for_workers(1) == []
+        assert daemon.store.get("finishing")["state"] == "done"
+    finally:
+        finish_callback.set()
+        daemon.store.close()
+
+
+def test_killed_worker_stays_executing_for_startup_recovery(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path, enabled=True)
+    try:
+        message = enqueue_message(daemon.store, "killed-worker", auto=True)
+        monkeypatch.setattr(relay, "resolve_background_route", lambda _logger, **_kwargs: {
+            "rows": [("test-model", "")],
+            "source": "test",
+        })
+        monkeypatch.setattr(relay, "pick_route_row", lambda _route, _model: ("test-model", "", None))
+        monkeypatch.setattr(relay.shutil, "which", lambda _name, path=None: "/usr/bin/python3")
+        monkeypatch.setattr(
+            relay,
+            "build_claude_cmd",
+            lambda *_args, **_kwargs: [
+                "/usr/bin/python3",
+                "-c",
+                "import signal,time; signal.signal(signal.SIGTERM, lambda *_: None); time.sleep(60)",
+            ],
+        )
+        monkeypatch.setattr(relay, "play_exec_alert", lambda _platform: None)
+        monkeypatch.setattr(relay, "play_done_alert", lambda _platform: None)
+
+        daemon._dispatch("killed-worker")
+        deadline = time.monotonic() + 2
+        while not daemon.executor.processes and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert daemon.executor.processes
+
+        daemon.executor.stop_dispatching()
+        assert daemon.executor.wait_for_workers(0.01) == ["killed-worker"]
+        daemon.executor.terminate_remaining_processes(grace_period=0)
+        assert daemon.executor.wait_for_workers(None) == []
+        assert daemon.store.get("killed-worker")["state"] == "executing"
+
+        daemon._closing = False
+        daemon.recover_interrupted()
+        assert daemon.store.get("killed-worker")["state"] == "held"
+        assert message["body"] == "hello"
     finally:
         daemon.store.close()
 
@@ -286,6 +432,29 @@ def test_poison_row_is_held_and_does_not_block_next_message(tmp_path, monkeypatc
         daemon.store.close()
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [sqlite3.OperationalError("database busy"), OSError("temporary filesystem error")],
+)
+def test_transient_dispatch_errors_leave_row_queued(tmp_path, monkeypatch, failure):
+    daemon = make_daemon(tmp_path)
+    try:
+        enqueue_message(daemon.store, "transient-dispatch")
+        daemon.shutdown_event = asyncio.Event()
+
+        def fail_dispatch(_msg_id):
+            daemon.shutdown_event.set()
+            raise failure
+
+        monkeypatch.setattr(daemon, "_dispatch", fail_dispatch)
+        monkeypatch.setattr(relay, "FILE_POLL_INTERVAL", 0)
+        asyncio.run(daemon.drain_queued())
+
+        assert daemon.store.get("transient-dispatch")["state"] == "queued"
+    finally:
+        daemon.store.close()
+
+
 def test_failed_held_file_write_keeps_payload_and_retries_on_drain(tmp_path, monkeypatch):
     daemon = make_daemon(tmp_path, enabled=True)
     try:
@@ -320,6 +489,140 @@ def test_failed_held_file_write_keeps_payload_and_retries_on_drain(tmp_path, mon
         daemon.store.close()
 
 
+def test_confirmed_held_file_pickup_is_not_recreated_by_drain(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path)
+    try:
+        enqueue_message(daemon.store, "picked-up")
+        assert daemon._hold_message("picked-up", {"body": "hello"}, "manual")
+        row = daemon.store.get("picked-up")
+        assert row["held_written"] == 1
+
+        held_path = daemon.config.state_dir / "held" / "picked-up.json"
+        held_path.unlink()
+        daemon.shutdown_event = asyncio.Event()
+        original_ensure = daemon._ensure_held_files
+        calls = 0
+
+        def ensure_for_three_drains():
+            nonlocal calls
+            original_ensure()
+            calls += 1
+            if calls == 3:
+                daemon.shutdown_event.set()
+
+        monkeypatch.setattr(daemon, "_ensure_held_files", ensure_for_three_drains)
+        monkeypatch.setattr(relay, "FILE_POLL_INTERVAL", 0)
+        asyncio.run(daemon.drain_queued())
+
+        assert calls == 3
+        assert not held_path.exists()
+        assert daemon.store.get("picked-up")["held_written"] == 1
+    finally:
+        daemon.store.close()
+
+
+@pytest.mark.parametrize("has_file", [True, False])
+def test_legacy_held_rows_migrate_as_already_picked_up(tmp_path, has_file):
+    daemon = make_daemon(tmp_path, open_store=False)
+    state_dir = daemon.config.state_dir
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = state_dir / "relay-state.sqlite3"
+    connection = sqlite3.connect(db_path)
+    connection.execute("""CREATE TABLE messages (
+        msg_id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        state TEXT NOT NULL,
+        received_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        payload TEXT
+    )""")
+    connection.execute(
+        "INSERT INTO messages VALUES (?, ?, 'held', ?, ?, ?)",
+        ("legacy-held", "test", time.time(), time.time(), json.dumps({"body": "hello"})),
+    )
+    connection.commit()
+    connection.close()
+
+    held_path = state_dir / "held" / "legacy-held.json"
+    if has_file:
+        held_path.parent.mkdir(parents=True)
+        held_path.write_text('{"body": "hello"}', encoding="utf-8")
+
+    daemon.store = relay.RelayStore(state_dir, logger=daemon.logger)
+    daemon.executor.store = daemon.store
+    try:
+        assert daemon.store.get("legacy-held")["held_written"] == 1
+        daemon._ensure_held_files()
+        assert held_path.exists() is has_file
+
+        if not has_file:
+            warnings = [call for call in daemon.logger.warning.call_args_list
+                        if "legacy-held" in str(call)]
+            assert len(warnings) == 1
+
+        daemon.store.close()
+        daemon.store = relay.RelayStore(state_dir, logger=daemon.logger)
+        assert daemon.store.get("legacy-held")["held_written"] == 1
+        if not has_file:
+            warnings = [call for call in daemon.logger.warning.call_args_list
+                        if "legacy-held" in str(call)]
+            assert len(warnings) == 1
+    finally:
+        daemon.store.close()
+
+
+def test_directory_fsync_einval_is_accepted_for_inbox_and_held_files(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path)
+    original_fsync = os.fsync
+
+    async def refuse_tcp(*_args, **_kwargs):
+        raise ConnectionRefusedError("test fallback")
+
+    def reject_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(relay.errno.EINVAL, "directory fsync unsupported")
+        return original_fsync(fd)
+
+    try:
+        monkeypatch.setattr(daemon.config, "get_peer_ip", lambda _target: "127.0.0.1")
+        monkeypatch.setattr(relay.asyncio, "open_connection", refuse_tcp)
+        with mock.patch.object(relay.os, "fsync", side_effect=reject_directory_fsync):
+            result = asyncio.run(daemon._send_to_target("peer", {"body": "hello"}))
+        assert result["method"] == "file"
+
+        enqueue_message(daemon.store, "held-einval")
+        with mock.patch.object(relay.os, "fsync", side_effect=reject_directory_fsync):
+            daemon._hold_message("held-einval", {"body": "hello"}, "manual")
+        assert daemon.store.get("held-einval")["held_written"] == 1
+    finally:
+        daemon.store.close()
+
+
+def test_held_directory_fsync_eio_keeps_row_unwritten_until_retry(tmp_path):
+    daemon = make_daemon(tmp_path)
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_first_directory_fsync(fd):
+        nonlocal failed
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and not failed:
+            failed = True
+            raise OSError(relay.errno.EIO, "directory fsync failed")
+        return original_fsync(fd)
+
+    try:
+        enqueue_message(daemon.store, "held-eio")
+        with mock.patch.object(relay.os, "fsync", side_effect=fail_first_directory_fsync):
+            daemon._hold_message("held-eio", {"body": "hello"}, "manual")
+        assert failed
+        assert daemon.store.get("held-eio")["held_written"] == 0
+
+        daemon._ensure_held_files()
+        assert daemon.store.get("held-eio")["held_written"] == 1
+    finally:
+        daemon.store.close()
+
+
 def test_prune_preserves_young_rows_over_cap_and_enqueue_refuses(tmp_path):
     store = relay.RelayStore(tmp_path / "state")
     try:
@@ -330,7 +633,11 @@ def test_prune_preserves_young_rows_over_cap_and_enqueue_refuses(tmp_path):
 
         with mock.patch.object(relay, "STORE_MAX_ROWS", 2):
             store.prune(now=time.time())
-            assert len([store.get(msg_id) for msg_id in ("one", "two", "three")]) == 3
+            for msg_id in ("one", "two", "three"):
+                row = store.get(msg_id)
+                assert row is not None
+                assert row["state"] == "done"
+            assert store.connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3
             with pytest.raises(relay.StoreFullError):
                 store.enqueue("four", {"body": "new"}, "test")
             assert not store.enqueue("three", {"body": "duplicate"}, "test")
@@ -355,6 +662,25 @@ def test_held_row_without_confirmed_file_is_never_pruned(tmp_path):
         row = store.get("old-held")
         assert row is not None
         assert row["payload"]["body"] == "hello"
+    finally:
+        store.close()
+
+
+def test_old_picked_up_held_row_prunes_even_if_file_is_missing(tmp_path):
+    store = relay.RelayStore(tmp_path / "state")
+    try:
+        enqueue_message(store, "old-picked-up")
+        assert store.set_state("old-picked-up", "held", expected_state="queued", reason="manual")
+        with store.lock:
+            store.connection.execute(
+                "UPDATE messages SET held_written = 1, received_at = ? WHERE msg_id = ?",
+                (time.time() - relay.DEDUP_TTL - 1, "old-picked-up"),
+            )
+            store.connection.commit()
+
+        store.prune()
+
+        assert store.get("old-picked-up") is None
     finally:
         store.close()
 
@@ -415,6 +741,7 @@ def test_startup_logs_effective_auto_execute_setting_once(tmp_path):
                 if args and str(args[0]).startswith("Effective auto_execute.enabled=")]
     assert messages == ["Effective auto_execute.enabled=False"]
     assert daemon.store is None
+    assert daemon.executor.store is None
     assert daemon._lock_fd is None
 
 
