@@ -353,6 +353,29 @@ def test_stopping_before_execution_popen_requeues_row(tmp_path):
         daemon.store.close()
 
 
+def test_execution_popen_none_requeues_row(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path, enabled=True)
+    try:
+        message = enqueue_message(daemon.store, "popen-none", auto=True)
+        monkeypatch.setattr(relay, "resolve_background_route", lambda *_args, **_kwargs: {
+            "rows": [("test-model", "")], "source": "test",
+        })
+        monkeypatch.setattr(relay, "pick_route_row", lambda *_args: ("test-model", "", None))
+        monkeypatch.setattr(relay.shutil, "which", lambda *_args, **_kwargs: "/usr/bin/claude")
+        monkeypatch.setattr(relay, "build_claude_cmd", lambda *_args, **_kwargs: ["stub-worker"])
+        monkeypatch.setattr(relay, "play_exec_alert", lambda _platform: None)
+        monkeypatch.setattr(relay.subprocess, "Popen", lambda *_args, **_kwargs: None)
+
+        daemon._dispatch("popen-none")
+        assert daemon.executor.wait_for_workers(2) == []
+        row = daemon.store.get("popen-none")
+        assert row["state"] == "queued"
+        assert row["payload"] == message
+        assert daemon.executor.processes == {}
+    finally:
+        daemon.store.close()
+
+
 def test_dispatch_runtime_error_retries_then_holds_after_five_attempts(tmp_path):
     daemon = make_daemon(tmp_path, enabled=True)
     try:
@@ -579,6 +602,18 @@ def test_run_shutdown_releases_lock_with_live_stub_worker(tmp_path, monkeypatch)
         assert daemon.executor.wait_for_workers(0) == []
 
         second = make_daemon(tmp_path, open_store=False)
+        recovered = relay.RelayStore(daemon.config.state_dir)
+        try:
+            row = recovered.get("shutdown-live-worker")
+            assert row["state"] == "executing"
+            assert row["payload"] == {
+                "msg_id": "shutdown-live-worker",
+                "from": "sender",
+                "body": "run",
+                "auto_execute": True,
+            }
+        finally:
+            recovered.close()
         assert second._acquire_instance_lock()
         second._release_instance_lock()
     finally:
@@ -673,29 +708,93 @@ def test_shutdown_persists_blocked_reply_and_startup_resends_once(tmp_path, monk
         pending = json.loads(pending_path.read_text(encoding="utf-8"))
         assert pending["result"] == "child result"
         assert pending["success"] is True
-        assert set(pending) == {"msg_id", "from", "result", "success"}
+        assert pending["attempts"] == 1
+        assert set(pending) == {"msg_id", "from", "result", "success", "attempts"}
         assert all(kwargs.get("start_new_session") is True for _cmd, kwargs in popen_kwargs)
         daemon.store.close()
 
         retry_daemon = make_daemon(tmp_path, open_store=False)
+        retry_daemon.config.tailscale_ip = "127.0.0.1"
         retried_commands = []
+        startup_events = []
+
+        class RetryServer:
+            def close(self):
+                return None
+
+            async def wait_closed(self):
+                return None
+
+        async def retry_start_server(*_args, **_kwargs):
+            startup_events.append("tcp")
+            return RetryServer()
+
+        async def retry_start_unix_server(*_args, **kwargs):
+            startup_events.append("uds")
+            Path(kwargs["path"]).touch()
+            return RetryServer()
+
+        async def stop_retry_run():
+            retry_daemon.shutdown_event.set()
+
+        async def idle_retry_drain():
+            await asyncio.Event().wait()
 
         def successful_popen(cmd, **kwargs):
+            startup_events.append("reply")
             retried_commands.append((cmd, kwargs))
             return SuccessfulReply()
 
         monkeypatch.setattr(relay.subprocess, "Popen", successful_popen)
+        monkeypatch.setattr(relay.asyncio, "start_server", retry_start_server)
+        monkeypatch.setattr(relay.asyncio, "start_unix_server", retry_start_unix_server)
+        monkeypatch.setattr(retry_daemon, "watch_file_inbox", stop_retry_run)
+        monkeypatch.setattr(retry_daemon, "drain_queued", idle_retry_drain)
         asyncio.run(retry_daemon.run())
 
         assert len(retried_commands) == 1
         assert "send" in retried_commands[0][0]
         assert "child result" in retried_commands[0][0][-1]
+        assert retried_commands[0][0][4] == "--msg-id"
+        assert retried_commands[0][0][5] == relay._reply_msg_id(message["msg_id"])
         assert retried_commands[0][1]["start_new_session"] is True
+        assert startup_events.index("tcp") < startup_events.index("reply")
+        assert startup_events.index("uds") < startup_events.index("reply")
         assert not pending_path.exists()
     finally:
         if daemon.store is not None:
             daemon.store.close()
         daemon._release_instance_lock()
+
+
+def test_pending_reply_deadletters_after_three_started_attempts(tmp_path):
+    daemon = make_daemon(tmp_path, open_store=False)
+    original = {"msg_id": "retry-limit", "from": "sender", "body": "task"}
+    pending_path = daemon.executor._persist_reply_pending(original, "result", True)
+    started_failure = relay.ReplySendResult(delivered=False, started=True)
+    daemon.executor._send_result_back = mock.Mock(return_value=started_failure)
+    for expected_attempts in (1, 2):
+        daemon.executor.resend_pending_replies()
+        record = json.loads(pending_path.read_text(encoding="utf-8"))
+        assert record["attempts"] == expected_attempts
+
+    daemon.executor.resend_pending_replies()
+    dead_path = daemon.config.state_dir / "held" / "retry-limit.reply-dead.json"
+    dead = json.loads(dead_path.read_text(encoding="utf-8"))
+    assert dead["attempts"] == 3
+    assert not pending_path.exists()
+    assert daemon.executor._send_result_back.call_count == 3
+
+
+@pytest.mark.parametrize("msg_id", ["..", "../escape", "x" * 129])
+def test_invalid_msg_id_cannot_build_held_path(tmp_path, msg_id):
+    daemon = make_daemon(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="Message ID is invalid"):
+            daemon._write_held_file(msg_id, {"body": "hello"}, "manual")
+        assert not (daemon.config.state_dir / "held").exists()
+    finally:
+        daemon.store.close()
 
 
 @pytest.mark.parametrize("body", [None, 7])
@@ -862,23 +961,14 @@ def test_legacy_held_rows_migrate_as_already_picked_up(tmp_path, has_file):
         daemon._ensure_held_files()
         assert held_path.exists() is has_file
 
-        if not has_file:
-            warnings = [call for call in daemon.logger.warning.call_args_list
-                        if "legacy-held" in str(call)]
-            assert len(warnings) == 1
-
         daemon.store.close()
         daemon.store = relay.RelayStore(state_dir, logger=daemon.logger)
         assert daemon.store.get("legacy-held")["held_written"] == 1
-        if not has_file:
-            warnings = [call for call in daemon.logger.warning.call_args_list
-                        if "legacy-held" in str(call)]
-            assert len(warnings) == 1
     finally:
         daemon.store.close()
 
 
-def test_user_version_one_migrates_existing_held_written_column(tmp_path):
+def test_user_version_zero_preserves_and_retries_existing_held_written_column(tmp_path):
     daemon = make_daemon(tmp_path, open_store=False)
     state_dir = daemon.config.state_dir
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -896,19 +986,36 @@ def test_user_version_one_migrates_existing_held_written_column(tmp_path):
     )""")
     connection.execute(
         "INSERT INTO messages VALUES (?, ?, 'held', ?, ?, ?, 0, ?)",
-        ("version-one-held", "test", time.time(), time.time(), json.dumps({"body": "hello"}), "manual"),
+        ("version-zero-held", "test", time.time(), time.time(), json.dumps({"body": "hello"}), "manual"),
     )
-    connection.execute("PRAGMA user_version = 1")
+    connection.execute("PRAGMA user_version = 0")
     connection.commit()
     connection.close()
 
     daemon.store = relay.RelayStore(state_dir, logger=daemon.logger)
     daemon.executor.store = daemon.store
     try:
-        assert daemon.store.get("version-one-held")["held_written"] == 1
+        row = daemon.store.get("version-zero-held")
+        assert row["held_written"] == 0
         assert daemon.store.connection.execute("PRAGMA user_version").fetchone()[0] == 2
-    finally:
+        held_path = state_dir / "held" / "version-zero-held.json"
+        assert not held_path.exists()
         daemon.store.close()
+        daemon.store = None
+        daemon.executor.store = None
+
+        # run() performs the held-file retry before it checks whether the daemon
+        # can bind its configured Tailscale address.
+        asyncio.run(daemon.run())
+        restarted = relay.RelayStore(state_dir)
+        try:
+            assert held_path.is_file()
+            assert restarted.get("version-zero-held")["held_written"] == 1
+        finally:
+            restarted.close()
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
 
 
 def test_directory_fsync_einval_is_accepted_for_inbox_and_held_files(tmp_path, monkeypatch):
@@ -961,6 +1068,21 @@ def test_directory_fsync_only_accepts_documented_unsupported_errnos(tmp_path, un
     with mock.patch.object(relay.os, "open", side_effect=OSError(relay.errno.EINVAL, "open failed")):
         with pytest.raises(OSError, match="open failed"):
             relay._fsync_directory(directory, logger=mock.Mock())
+
+
+@pytest.mark.parametrize("failure_errno", [relay.errno.EBADF, relay.errno.EPERM, relay.errno.EIO])
+def test_directory_fsync_propagates_other_errors(tmp_path, monkeypatch, failure_errno):
+    directory = tmp_path / "directory"
+    directory.mkdir()
+
+    def reject_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(failure_errno, "directory fsync failed")
+
+    monkeypatch.setattr(relay.os, "fsync", reject_directory)
+    with pytest.raises(OSError) as exc_info:
+        relay._fsync_directory(directory, logger=mock.Mock())
+    assert exc_info.value.errno == failure_errno
 
 
 def test_held_directory_fsync_eio_keeps_row_unwritten_until_retry(tmp_path):

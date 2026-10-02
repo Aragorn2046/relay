@@ -21,6 +21,7 @@ Usage (daemon):
 """
 
 import asyncio
+from dataclasses import dataclass
 import errno
 import fcntl
 import hashlib
@@ -45,7 +46,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "2.1.3"
+VERSION = "2.1.4"
 DEFAULT_PORT = 7272
 MAX_MESSAGE_SIZE = 1_048_576  # 1 MB
 HMAC_MAX_AGE = 300.0  # 5 minutes
@@ -66,6 +67,8 @@ _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset({
 })
 _UNSUPPORTED_DIRECTORY_FSYNC_LOGGED = False
 _UNSUPPORTED_DIRECTORY_FSYNC_LOCK = threading.Lock()
+MESSAGE_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+MAX_REPLY_ATTEMPTS = 3
 
 assert DEDUP_TTL >= 2 * HMAC_MAX_AGE, "dedup TTL must cover the full HMAC replay window"
 
@@ -111,7 +114,7 @@ def detect_tailscale_ip():
         try:
             result = subprocess.run(
                 [cmd, "ip", "-4"],
-                capture_output=True, text=True, timeout=5, start_new_session=True
+                capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0:
                 ip = result.stdout.strip().splitlines()[0].strip() if result.stdout else ""
@@ -123,7 +126,7 @@ def detect_tailscale_ip():
     # Fallback: parse ip addr for 100.x.x.x (WSL2 mirrored networking)
     try:
         result = subprocess.run(
-            ["ip", "addr"], capture_output=True, text=True, timeout=5, start_new_session=True
+            ["ip", "addr"], capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
             for line in result.stdout.splitlines():
@@ -270,7 +273,10 @@ class Config:
 
 def sign_message(payload, secret):
     """Add HMAC-SHA256 signature and metadata to a message."""
-    payload["msg_id"] = str(uuid.uuid4())
+    msg_id = payload.get("msg_id")
+    if not _valid_msg_id(msg_id):
+        msg_id = str(uuid.uuid4())
+    payload["msg_id"] = msg_id
     payload["timestamp"] = time.time()
 
     # Canonical serialization (without signature)
@@ -309,7 +315,7 @@ def verify_message(message, secret, max_age=HMAC_MAX_AGE, now=None):
             return False
 
         msg_id = message.get("msg_id")
-        if not isinstance(msg_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", msg_id):
+        if not _valid_msg_id(msg_id):
             return False
 
         unsigned = dict(message)
@@ -319,6 +325,21 @@ def verify_message(message, secret, max_age=HMAC_MAX_AGE, now=None):
         return hmac.compare_digest(signature, expected)
     except Exception:
         return False
+
+
+def _valid_msg_id(msg_id):
+    return isinstance(msg_id, str) and msg_id != ".." and MESSAGE_ID_RE.fullmatch(msg_id) is not None
+
+
+def _validate_msg_id(msg_id):
+    if not _valid_msg_id(msg_id):
+        raise ValueError("Message ID is invalid")
+    return msg_id
+
+
+def _reply_msg_id(msg_id):
+    _validate_msg_id(msg_id)
+    return "reply-" + hashlib.sha256(msg_id.encode("utf-8")).hexdigest()
 
 
 def validate_inbound_message(message):
@@ -413,31 +434,24 @@ class RelayStore:
                 held_reason TEXT
             )""")
             user_version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-            missing_legacy_files = []
             if user_version < 2:
                 self.connection.execute("BEGIN IMMEDIATE")
                 try:
                     columns = {
                         row[1] for row in self.connection.execute("PRAGMA table_info(messages)")
                     }
-                    if "held_written" not in columns:
+                    added_held_written = "held_written" not in columns
+                    if added_held_written:
                         self.connection.execute(
                             "ALTER TABLE messages ADD COLUMN held_written INTEGER NOT NULL DEFAULT 0"
                         )
                     if "held_reason" not in columns:
                         self.connection.execute("ALTER TABLE messages ADD COLUMN held_reason TEXT")
-                    legacy_held = self.connection.execute(
-                        "SELECT msg_id FROM messages WHERE state = 'held' AND held_written = 0"
-                    ).fetchall()
-                    missing_legacy_files = [
-                        row["msg_id"]
-                        for row in legacy_held
-                        if not (self.state_dir / "held" / f"{row['msg_id']}.json").is_file()
-                    ]
-                    self.connection.execute(
-                        "UPDATE messages SET held_written = 1 "
-                        "WHERE state = 'held' AND held_written = 0"
-                    )
+                    if added_held_written:
+                        # Rows in the old schema predate durable pickup files.
+                        self.connection.execute(
+                            "UPDATE messages SET held_written = 1 WHERE state = 'held'"
+                        )
                     self.connection.execute("PRAGMA user_version = 2")
                     self.connection.commit()
                 except Exception:
@@ -449,11 +463,6 @@ class RelayStore:
             )
             self.connection.commit()
             self._secure_modes()
-            if missing_legacy_files:
-                self.logger.warning(
-                    "Legacy held messages without pickup files treated as picked up: %s",
-                    ", ".join(missing_legacy_files),
-                )
 
     def _secure_modes(self):
         for path in (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
@@ -627,7 +636,7 @@ def play_alert(platform):
         if platform == "darwin":
             subprocess.run(
                 ["afplay", "/System/Library/Sounds/Glass.aiff"],
-                capture_output=True, timeout=2, start_new_session=True
+                capture_output=True, timeout=5
             )
         else:
             ps_cmd = (
@@ -637,7 +646,7 @@ def play_alert(platform):
             )
             subprocess.run(
                 ["powershell.exe", "-Command", ps_cmd],
-                capture_output=True, timeout=2, start_new_session=True
+                capture_output=True, timeout=5
             )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
@@ -649,7 +658,7 @@ def play_exec_alert(platform):
         if platform == "darwin":
             subprocess.run(
                 ["afplay", "/System/Library/Sounds/Purr.aiff"],
-                capture_output=True, timeout=2, start_new_session=True
+                capture_output=True, timeout=5
             )
         else:
             ps_cmd = (
@@ -661,7 +670,7 @@ def play_exec_alert(platform):
             )
             subprocess.run(
                 ["powershell.exe", "-Command", ps_cmd],
-                capture_output=True, timeout=2, start_new_session=True
+                capture_output=True, timeout=5
             )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
@@ -673,13 +682,13 @@ def play_done_alert(platform):
         if platform == "darwin":
             subprocess.run(
                 ["afplay", "/System/Library/Sounds/Ping.aiff"],
-                capture_output=True, timeout=2, start_new_session=True
+                capture_output=True, timeout=5
             )
         else:
             ps_cmd = "[Console]::Beep(1200,150); Start-Sleep -Milliseconds 50; [Console]::Beep(800,200)"
             subprocess.run(
                 ["powershell.exe", "-Command", ps_cmd],
-                capture_output=True, timeout=2, start_new_session=True
+                capture_output=True, timeout=5
             )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
@@ -689,6 +698,12 @@ def play_done_alert(platform):
 
 class RouteRefused(Exception):
     """The registry answered, but with a route these runs must not launch."""
+
+
+@dataclass(frozen=True)
+class ReplySendResult:
+    delivered: bool
+    started: bool
 
 
 def _signal_process_group(process, signum):
@@ -815,6 +830,7 @@ class AutoExecutor:
         self.processes = {}  # Execution children only; these gate terminal callbacks.
         self.helper_processes = {}  # Route and reply helpers do not gate known results.
         self._stopping = False
+        self._shutdown_deadline = None
         self._shutdown_killed = set()
 
     def can_accept(self):
@@ -860,10 +876,15 @@ class AutoExecutor:
             pass
         return WORKER_START_FAILED
 
-    def stop_dispatching(self):
+    def stop_dispatching(self, shutdown_deadline=None):
         """Prevent new worker threads and execution subprocesses from starting."""
         with self.lock:
             self._stopping = True
+            deadline = shutdown_deadline if shutdown_deadline is not None else time.monotonic() + 18.0
+            if self._shutdown_deadline is None:
+                self._shutdown_deadline = deadline
+            else:
+                self._shutdown_deadline = min(self._shutdown_deadline, deadline)
 
     def _start_worker_process(self, cmd, *, execution=False, **kwargs):
         worker = threading.current_thread()
@@ -872,6 +893,8 @@ class AutoExecutor:
                 return None
             kwargs["start_new_session"] = True
             process = subprocess.Popen(cmd, **kwargs)
+            if process is None:
+                return None
             if execution:
                 self.processes[worker] = process
             else:
@@ -923,6 +946,8 @@ class AutoExecutor:
 
     def _forget_worker_process(self, worker, process):
         with self.lock:
+            if process.poll() is None:
+                return
             if self.processes.get(worker) is process:
                 self.processes.pop(worker, None)
             helpers = self.helper_processes.get(worker)
@@ -930,6 +955,13 @@ class AutoExecutor:
                 helpers.discard(process)
                 if not helpers:
                     self.helper_processes.pop(worker, None)
+
+    def _worker_process_timeout(self, maximum):
+        with self.lock:
+            if not self._stopping or self._shutdown_deadline is None:
+                return maximum
+            remaining = max(0.0, self._shutdown_deadline - time.monotonic())
+            return min(maximum, remaining)
 
     def _worker_was_shutdown_killed(self, worker=None):
         worker = worker or threading.current_thread()
@@ -1033,16 +1065,22 @@ class AutoExecutor:
         budget = 0.0
         model = "(unknown)"
 
-        def report_completion(outcome):
-            nonlocal completion_reported
-            if not completion_reported:
+        def report_completion(outcome, allow_stopping=False):
+            nonlocal completion_allowed, completion_reported
+            if completion_reported:
+                return True
+            with self.lock:
+                if not allow_stopping and (self._stopping or worker in self._shutdown_killed):
+                    completion_allowed = False
+                    return False
                 self._call_on_done(on_done, outcome)
                 completion_reported = True
+            return True
 
         def report_not_started():
             nonlocal completion_allowed
             completion_allowed = False
-            report_completion(EXECUTION_NOT_STARTED)
+            report_completion(EXECUTION_NOT_STARTED, allow_stopping=True)
 
         try:
             if self._is_stopping():
@@ -1073,13 +1111,18 @@ class AutoExecutor:
                     report_not_started()
                     return
                 reason = f"REFUSED: the Model Routing registry route for {ROUTE_CONSUMER} cannot run: {exc}"
-                report_completion(False)
+                if not report_completion(False):
+                    return
                 try:
                     self.logger.error(f"AUTO-EXEC {reason} (task: {task[:80]})")
                     print(f"ERROR: {reason}", file=sys.stderr, flush=True)
                     self._log_to_vault_bounded(task, reason, False, 0.0, "(refused)", budget)
-                    if msg.get("reply_to") and not self._send_result_back(msg, reason, False):
-                        self._persist_reply_pending(msg, reason, False)
+                    if msg.get("reply_to"):
+                        reply_result = self._send_result_back(msg, reason, False)
+                        if not reply_result.delivered:
+                            self._persist_reply_pending(
+                                msg, reason, False, attempts=int(reply_result.started)
+                            )
                 except Exception as log_exc:  # never leak the concurrency slot
                     try:
                         self.logger.error(f"AUTO-EXEC refusal could not be reported: {log_exc}")
@@ -1175,11 +1218,16 @@ class AutoExecutor:
 
             duration = time.time() - start
             status = "SUCCESS" if success else "FAILED"
-            report_completion(success)
+            if not report_completion(success):
+                return
             self.logger.info(f"AUTO-EXEC {status} ({duration:.0f}s): {task[:80]}")
             self._log_to_vault_bounded(task, result, success, duration, model, budget)
-            if msg.get("reply_to") and not self._send_result_back(msg, result, success):
-                self._persist_reply_pending(msg, result, success)
+            if msg.get("reply_to"):
+                reply_result = self._send_result_back(msg, result, success)
+                if not reply_result.delivered:
+                    self._persist_reply_pending(
+                        msg, result, success, attempts=int(reply_result.started)
+                    )
             if not self._is_stopping():
                 try:
                     play_done_alert(self.config.platform)
@@ -1197,8 +1245,16 @@ class AutoExecutor:
             with self.lock:
                 self.active = max(0, self.active - 1)
                 self.workers.pop(worker, None)
-                self.processes.pop(worker, None)
-                self.helper_processes.pop(worker, None)
+                process = self.processes.get(worker)
+                if process is None or process.poll() is not None:
+                    self.processes.pop(worker, None)
+                helpers = self.helper_processes.get(worker)
+                if helpers is not None:
+                    live_helpers = {child for child in helpers if child.poll() is None}
+                    if live_helpers:
+                        self.helper_processes[worker] = live_helpers
+                    else:
+                        self.helper_processes.pop(worker, None)
                 self._shutdown_killed.discard(worker)
 
     def _is_stopping(self):
@@ -1228,52 +1284,89 @@ class AutoExecutor:
         if not finished.wait(timeout=1.0):
             self.logger.warning("AUTO-EXEC vault logging exceeded its 1s worker budget")
 
-    def _persist_reply_pending(self, original_msg, result, success):
-        msg_id = str(original_msg.get("msg_id", "unknown"))
-        held_dir = self.config.state_dir / "held"
-        held_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(held_dir, 0o700)
-        record = {
-            "msg_id": msg_id,
-            "from": original_msg.get("from", ""),
-            "result": result,
-            "success": bool(success),
-        }
-        pending_path = held_dir / f"{msg_id}.reply-pending.json"
-        tmp_path = held_dir / f".{msg_id}.{uuid.uuid4().hex}.reply-pending.tmp"
+    def _write_reply_record(self, held_dir, path, msg_id, record):
+        _validate_msg_id(msg_id)
+        tmp_path = held_dir / f".{msg_id}.{uuid.uuid4().hex}.reply.tmp"
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump(record, stream, indent=2)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(tmp_path, pending_path)
+            os.replace(tmp_path, path)
             _fsync_directory(held_dir, logger=self.logger)
         finally:
             try:
                 tmp_path.unlink()
             except FileNotFoundError:
                 pass
-        self.logger.warning(f"AUTO-EXEC reply pending for {msg_id}: saved to {pending_path}")
-        return pending_path
+
+    def _persist_reply_pending(self, original_msg, result, success, attempts=0):
+        raw_msg_id = original_msg.get("msg_id", "unknown")
+        msg_id_for_log = str(raw_msg_id)[:128]
+        try:
+            msg_id = _validate_msg_id(raw_msg_id)
+            if type(attempts) is not int or attempts < 0:
+                raise ValueError("pending reply attempt count is invalid")
+            held_dir = self.config.state_dir / "held"
+            held_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(held_dir, 0o700)
+            record = {
+                "msg_id": msg_id,
+                "from": original_msg.get("from", ""),
+                "result": result,
+                "success": bool(success),
+                "attempts": attempts,
+            }
+            pending_path = held_dir / f"{msg_id}.reply-pending.json"
+            self._write_reply_record(held_dir, pending_path, msg_id, record)
+            self.logger.warning(f"AUTO-EXEC reply pending for {msg_id}: saved to {pending_path}")
+            return pending_path
+        except Exception as exc:
+            self.logger.error(f"Could not persist pending reply for {msg_id_for_log}: {exc}")
+            return None
 
     def resend_pending_replies(self):
-        """Retry each durable result once; keep failures for a later daemon start."""
+        """Retry pending results, then dead-letter after three helper starts."""
         held_dir = self.config.state_dir / "held"
         if not held_dir.is_dir():
             return
         for pending_path in sorted(held_dir.glob("*.reply-pending.json")):
             try:
                 record = json.loads(pending_path.read_text(encoding="utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("pending reply record must be an object")
+                msg_id = _validate_msg_id(record.get("msg_id"))
+                attempts = record.get("attempts", 0)
+                if type(attempts) is not int or attempts < 0:
+                    raise ValueError("pending reply attempt count is invalid")
+                dead_path = held_dir / f"{msg_id}.reply-dead.json"
+                if attempts >= MAX_REPLY_ATTEMPTS:
+                    os.replace(pending_path, dead_path)
+                    _fsync_directory(held_dir, logger=self.logger)
+                    self.logger.error(f"Pending AUTO-EXEC reply exhausted attempts for {msg_id}")
+                    continue
                 msg = {
-                    "msg_id": record["msg_id"],
+                    "msg_id": msg_id,
                     "from": record["from"],
                     "body": "",
                 }
-                if self._send_result_back(msg, record["result"], bool(record["success"])):
+                reply_result = self._send_result_back(
+                    msg, record["result"], bool(record["success"])
+                )
+                if reply_result.delivered:
                     pending_path.unlink()
                     _fsync_directory(held_dir, logger=self.logger)
-                    self.logger.info(f"Resent pending AUTO-EXEC reply {record['msg_id']}")
+                    self.logger.info(f"Resent pending AUTO-EXEC reply {msg_id}")
+                elif reply_result.started:
+                    record["attempts"] = attempts + 1
+                    if record["attempts"] >= MAX_REPLY_ATTEMPTS:
+                        self._write_reply_record(held_dir, dead_path, msg_id, record)
+                        pending_path.unlink()
+                        _fsync_directory(held_dir, logger=self.logger)
+                        self.logger.error(f"Pending AUTO-EXEC reply exhausted attempts for {msg_id}")
+                    else:
+                        self._write_reply_record(held_dir, pending_path, msg_id, record)
             except Exception as exc:
                 self.logger.warning(f"Could not resend pending AUTO-EXEC reply {pending_path.name}: {exc}")
 
@@ -1295,48 +1388,58 @@ class AutoExecutor:
             self.logger.warning(f"Failed to log execution: {e}")
 
     def _send_result_back(self, original_msg, result, success):
+        process = None
+        started = False
+        msg_id = original_msg.get("msg_id", "unknown")
         try:
             sender = original_msg.get("from", "")
             if not sender:
-                return False
+                return ReplySendResult(False, False)
+            _validate_msg_id(msg_id)
             status = "completed" if success else "failed"
             context = original_msg.get("body", original_msg.get("message", ""))
             reply = f"[AUTO-RESULT: {status}] Re: {str(context)[:100]}\n\n{str(result)[:1500]}"
             worker = threading.current_thread()
+            reply_msg_id = _reply_msg_id(msg_id)
+            # Both receiver ingress paths dedupe through RelayStore's msg_id key.
+            # Keep this ID stable so an unknown delivery can be retried safely.
             process = self._start_worker_process(
-                [sys.executable, __file__, "send", sender, reply],
+                [sys.executable, __file__, "send", sender, "--msg-id", reply_msg_id, reply],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
             if process is None:
-                return False
+                return ReplySendResult(False, False)
+            started = True
             try:
-                process.communicate(timeout=5)
+                process.communicate(timeout=self._worker_process_timeout(30.0))
             except subprocess.TimeoutExpired:
                 try:
                     _signal_process_group(process, signal.SIGTERM)
                 except OSError as signal_exc:
                     self.logger.warning(f"Could not terminate result-reply helper: {signal_exc}")
                 try:
-                    process.communicate(timeout=5)
+                    process.communicate(timeout=self._worker_process_timeout(5.0))
                 except subprocess.TimeoutExpired:
                     try:
                         _signal_process_group(process, signal.SIGKILL)
                     except OSError as signal_exc:
                         self.logger.warning(f"Could not kill result-reply helper: {signal_exc}")
                     try:
-                        process.communicate(timeout=5)
+                        process.communicate(timeout=self._worker_process_timeout(5.0))
                     except subprocess.TimeoutExpired:
                         try:
-                            process.wait(timeout=5)
+                            process.wait(timeout=self._worker_process_timeout(5.0))
                         except subprocess.TimeoutExpired:
                             self.logger.error("Result-reply helper did not reap after SIGKILL")
-            finally:
+            if process.poll() is not None:
                 self._forget_worker_process(worker, process)
-            return process.returncode == 0
+            return ReplySendResult(process.returncode == 0, started)
         except Exception as e:
-            self.logger.warning(f"Failed to relay result back: {e}")
-            return False
+            self.logger.warning(f"Failed to relay result back for {msg_id}: {e}")
+            if process is not None and process.poll() is not None:
+                self._forget_worker_process(threading.current_thread(), process)
+            return ReplySendResult(False, started)
 
 
 # ── Daemon ──
@@ -1559,6 +1662,7 @@ class RelayDaemon:
                 pass
 
     def _write_held_file(self, msg_id, message, reason):
+        _validate_msg_id(msg_id)
         held_dir = self.config.state_dir / "held"
         held_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(held_dir, 0o700)
@@ -1910,12 +2014,12 @@ class RelayDaemon:
             subprocess.run(
                 ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new",
                  f"{ssh_user}@{peer_ip}", f"mkdir -p {remote_inbox}"],
-                capture_output=True, timeout=10, start_new_session=True
+                capture_output=True, timeout=10
             )
             subprocess.run(
                 ["scp", "-o", "ConnectTimeout=5",
                  str(tmp), f"{ssh_user}@{peer_ip}:{remote_inbox}/{filename}"],
-                capture_output=True, timeout=15, start_new_session=True
+                capture_output=True, timeout=15
             )
         except (subprocess.TimeoutExpired, OSError):
             pass
@@ -2172,7 +2276,6 @@ class RelayDaemon:
 
             self.recover_interrupted()
             self._ensure_held_files()
-            self.executor.resend_pending_replies()
             self._prune_store()
 
             if not self.config.tailscale_ip:
@@ -2203,6 +2306,7 @@ class RelayDaemon:
             owns_socket = True
             os.chmod(self.config.socket_path, 0o600)
             self.logger.info(f"UDS server listening on {self.config.socket_path}")
+            self.executor.resend_pending_replies()
 
             watcher_task = asyncio.create_task(self.watch_file_inbox())
             drain_task = asyncio.create_task(self.drain_queued())
@@ -2215,7 +2319,7 @@ class RelayDaemon:
                 self.logger.info("Shutting down...")
                 with self._lifecycle_lock:
                     self._closing = True
-                self.executor.stop_dispatching()
+                self.executor.stop_dispatching(shutdown_deadline=shutdown_deadline)
                 for server in (tcp_server, uds_server):
                     if server is not None:
                         server.close()
@@ -2236,8 +2340,16 @@ class RelayDaemon:
                     if pending:
                         self.logger.error("Relay background tasks did not stop within shutdown budget")
 
-                self.executor.terminate_remaining_processes(grace_period=5.0, reap_timeout=5.0)
-                join_timeout = max(0.0, min(10.0, shutdown_deadline - time.monotonic()))
+                join_timeout = max(0.0, min(3.0, shutdown_deadline - time.monotonic()))
+                self.executor.wait_for_workers(join_timeout)
+                remaining = max(0.0, shutdown_deadline - time.monotonic())
+                terminate_grace = min(5.0, remaining)
+                remaining = max(0.0, shutdown_deadline - time.monotonic() - terminate_grace)
+                terminate_reap = min(5.0, remaining)
+                self.executor.terminate_remaining_processes(
+                    grace_period=terminate_grace, reap_timeout=terminate_reap
+                )
+                join_timeout = max(0.0, shutdown_deadline - time.monotonic())
                 in_flight = self.executor.wait_for_workers(join_timeout)
                 if in_flight:
                     self.logger.error(
@@ -2266,7 +2378,9 @@ class RelayDaemon:
 
 # ── CLI Client ──
 
-def cli_send_via_daemon(socket_path, target, body, machine_name, auto=False, budget=1.0, model=None):
+def cli_send_via_daemon(
+    socket_path, target, body, machine_name, auto=False, budget=1.0, model=None, msg_id=None
+):
     """Send a message through the local daemon."""
     message = {
         "from": machine_name,
@@ -2275,6 +2389,8 @@ def cli_send_via_daemon(socket_path, target, body, machine_name, auto=False, bud
         "body": body,
         "auto_execute": auto,
     }
+    if msg_id is not None:
+        message["msg_id"] = _validate_msg_id(msg_id)
     if auto:
         message["budget"] = budget
         if model:  # no model = the receiver resolves it from the registry
@@ -2574,7 +2690,7 @@ def main():
     elif command == "send":
         args = sys.argv[2:]
         if not args:
-            print("Usage: relay.py send <dawn|dusk|day> [--auto] [--budget N] [--model M] \"message\"")
+            print("Usage: relay.py send <dawn|dusk|day> [--auto] [--budget N] [--model M] [--msg-id ID] \"message\"")
             sys.exit(1)
 
         target = args[0].lower()
@@ -2586,6 +2702,7 @@ def main():
         auto = False
         budget = config.default_budget
         model = None
+        msg_id = None
         msg_parts = []
         i = 0
         while i < len(args):
@@ -2597,15 +2714,21 @@ def main():
             elif args[i] == "--model" and i + 1 < len(args):
                 i += 1
                 model = args[i]
+            elif args[i] == "--msg-id" and i + 1 < len(args):
+                i += 1
+                msg_id = _validate_msg_id(args[i])
             else:
                 msg_parts.append(args[i])
             i += 1
         body = " ".join(msg_parts)
         if not body:
-            print("Usage: relay.py send <dawn|dusk|day> [--auto] [--budget N] [--model M] \"message\"")
+            print("Usage: relay.py send <dawn|dusk|day> [--auto] [--budget N] [--model M] [--msg-id ID] \"message\"")
             sys.exit(1)
 
-        cli_send_via_daemon(socket_path, target, body, config.machine, auto=auto, budget=budget, model=model)
+        cli_send_via_daemon(
+            socket_path, target, body, config.machine, auto=auto, budget=budget,
+            model=model, msg_id=msg_id,
+        )
 
     elif command == "check":
         cli_check(socket_path)
