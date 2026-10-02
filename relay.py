@@ -21,6 +21,8 @@ Usage (daemon):
 """
 
 import asyncio
+import errno
+import fcntl
 import hashlib
 import hmac
 import json
@@ -43,7 +45,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 DEFAULT_PORT = 7272
 MAX_MESSAGE_SIZE = 1_048_576  # 1 MB
 HMAC_MAX_AGE = 300.0  # 5 minutes
@@ -54,6 +56,8 @@ STORE_MAX_ROWS = 200_000
 TCP_CONNECT_TIMEOUT = 2.0
 TCP_READ_TIMEOUT = 5.0
 EXECUTION_TIMEOUT = 300  # 5 minutes
+FILE_DECODE_GRACE = 30.0
+WORKER_START_FAILED = object()
 
 assert DEDUP_TTL >= 2 * HMAC_MAX_AGE, "dedup TTL must cover the full HMAC replay window"
 
@@ -309,6 +313,21 @@ def verify_message(message, secret, max_age=HMAC_MAX_AGE, now=None):
         return False
 
 
+def validate_inbound_message(message):
+    """Reject message bodies that cannot be safely displayed or executed."""
+    if not isinstance(message, dict):
+        raise ValueError("Message must be a JSON object")
+    body = message.get("body", message.get("message", ""))
+    if not isinstance(body, str):
+        raise ValueError("Message body must be a string")
+    if len(body.encode("utf-8")) > MAX_MESSAGE_SIZE:
+        raise ValueError("Message body is too large")
+
+
+class StoreFullError(RuntimeError):
+    """Raised when replay-protected rows prevent another durable enqueue."""
+
+
 # ── Message Framing ──
 
 def frame_message(payload_bytes):
@@ -330,6 +349,15 @@ def frame_and_encode(msg_dict):
     """Serialize dict to framed bytes."""
     payload = json.dumps(msg_dict).encode("utf-8")
     return frame_message(payload)
+
+
+def _fsync_directory(path):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 # ── Durable message state and deduplication ──
@@ -359,8 +387,21 @@ class RelayStore:
                 state TEXT NOT NULL,
                 received_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
-                payload TEXT
+                payload TEXT,
+                held_written INTEGER NOT NULL DEFAULT 0,
+                held_reason TEXT
             )""")
+            columns = {row[1] for row in self.connection.execute("PRAGMA table_info(messages)")}
+            if "held_written" not in columns:
+                self.connection.execute(
+                    "ALTER TABLE messages ADD COLUMN held_written INTEGER NOT NULL DEFAULT 0"
+                )
+            if "held_reason" not in columns:
+                self.connection.execute("ALTER TABLE messages ADD COLUMN held_reason TEXT")
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_state_received "
+                "ON messages(state, received_at)"
+            )
             self.connection.commit()
             self._secure_modes()
 
@@ -376,8 +417,21 @@ class RelayStore:
         payload = json.dumps(message_dict, sort_keys=True, separators=(",", ":"))
         now = time.time()
         with self.lock:
+            existing = self.connection.execute(
+                "SELECT 1 FROM messages WHERE msg_id = ?", (msg_id,)
+            ).fetchone()
+            if existing:
+                return False
+            count = self.connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            if count >= STORE_MAX_ROWS:
+                self._prune_locked(now)
+                count = self.connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            if count >= STORE_MAX_ROWS:
+                self.connection.commit()
+                self._secure_modes()
+                raise StoreFullError(f"relay store is at its {STORE_MAX_ROWS}-row capacity")
             cursor = self.connection.execute(
-                "INSERT OR IGNORE INTO messages (msg_id, source, state, received_at, updated_at, payload) "
+                "INSERT INTO messages (msg_id, source, state, received_at, updated_at, payload) "
                 "VALUES (?, ?, 'queued', ?, ?, ?)",
                 (msg_id, source, now, now, payload),
             )
@@ -385,23 +439,49 @@ class RelayStore:
             self._secure_modes()
             return cursor.rowcount == 1
 
-    def set_state(self, msg_id, state):
+    def set_state(self, msg_id, state, expected_state, reason=None):
         if state not in self.STATES:
             raise ValueError(f"invalid relay state: {state}")
+        transitions = {
+            "queued": {"executing", "done", "held"},
+            "executing": {"queued", "done", "failed", "held"},
+        }
+        if state not in transitions.get(expected_state, set()):
+            raise ValueError(f"invalid relay transition: {expected_state} -> {state}")
         now = time.time()
         with self.lock:
             if state in ("done", "failed"):
-                self.connection.execute(
-                    "UPDATE messages SET state = ?, updated_at = ?, payload = NULL WHERE msg_id = ?",
-                    (state, now, msg_id),
+                cursor = self.connection.execute(
+                    "UPDATE messages SET state = ?, updated_at = ?, payload = NULL, "
+                    "held_written = 0, held_reason = NULL WHERE msg_id = ? AND state = ?",
+                    (state, now, msg_id, expected_state),
+                )
+            elif state == "held":
+                cursor = self.connection.execute(
+                    "UPDATE messages SET state = ?, updated_at = ?, held_written = 0, held_reason = ? "
+                    "WHERE msg_id = ? AND state = ?",
+                    (state, now, reason or "held", msg_id, expected_state),
                 )
             else:
-                self.connection.execute(
-                    "UPDATE messages SET state = ?, updated_at = ? WHERE msg_id = ?",
-                    (state, now, msg_id),
+                cursor = self.connection.execute(
+                    "UPDATE messages SET state = ?, updated_at = ?, held_written = 0, held_reason = NULL "
+                    "WHERE msg_id = ? AND state = ?",
+                    (state, now, msg_id, expected_state),
                 )
             self.connection.commit()
             self._secure_modes()
+            return cursor.rowcount == 1
+
+    def mark_held_written(self, msg_id):
+        with self.lock:
+            cursor = self.connection.execute(
+                "UPDATE messages SET held_written = 1, updated_at = ? "
+                "WHERE msg_id = ? AND state = 'held' AND payload IS NOT NULL",
+                (time.time(), msg_id),
+            )
+            self.connection.commit()
+            self._secure_modes()
+            return cursor.rowcount == 1
 
     def get(self, msg_id):
         with self.lock:
@@ -422,24 +502,35 @@ class RelayStore:
 
     def prune(self, now=None):
         now = time.time() if now is None else now
-        cutoff = now - DEDUP_TTL
-        terminal = ("done", "failed", "held")
-        placeholders = ",".join("?" for _ in terminal)
         with self.lock:
-            self.connection.execute(
-                f"DELETE FROM messages WHERE state IN ({placeholders}) AND received_at < ?",
-                (*terminal, cutoff),
-            )
-            count = self.connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-            excess = max(0, count - STORE_MAX_ROWS)
-            if excess:
-                self.connection.execute(
-                    f"DELETE FROM messages WHERE msg_id IN (SELECT msg_id FROM messages "
-                    f"WHERE state IN ({placeholders}) ORDER BY received_at ASC LIMIT ?)",
-                    (*terminal, excess),
-                )
+            self._prune_locked(now)
             self.connection.commit()
             self._secure_modes()
+
+    def _prune_locked(self, now):
+        cutoff = now - DEDUP_TTL
+        self.connection.execute(
+            "DELETE FROM messages WHERE state IN ('done', 'failed') AND received_at < ?",
+            (cutoff,),
+        )
+        held_rows = self.connection.execute(
+            "SELECT msg_id, held_written FROM messages "
+            "WHERE state = 'held' AND received_at < ? ORDER BY received_at ASC",
+            (cutoff,),
+        ).fetchall()
+        for row in held_rows:
+            held_path = self.state_dir / "held" / f"{row['msg_id']}.json"
+            if row["held_written"] and held_path.is_file():
+                self.connection.execute(
+                    "DELETE FROM messages WHERE msg_id = ? AND state = 'held' "
+                    "AND received_at < ? AND held_written = 1",
+                    (row["msg_id"], cutoff),
+                )
+            elif row["held_written"]:
+                self.connection.execute(
+                    "UPDATE messages SET held_written = 0 WHERE msg_id = ? AND state = 'held'",
+                    (row["msg_id"],),
+                )
 
     def _decode_row(self, row):
         if row is None:
@@ -635,7 +726,7 @@ def build_claude_cmd(claude_bin, model, budget, task, effort=None, fallback_mode
         cmd += ["--effort", effort]
     if fallback_model and fallback_model != model:
         cmd += ["--fallback-model", fallback_model]
-    return cmd + ["--max-budget-usd", str(budget), "-p", "--", task]
+    return cmd + ["--max-budget-usd", str(budget), "-p", task]
 
 
 class AutoExecutor:
@@ -645,6 +736,7 @@ class AutoExecutor:
         self.store = store
         self.active = 0
         self.lock = threading.Lock()
+        self.workers = {}
 
     def can_accept(self):
         with self.lock:
@@ -669,19 +761,34 @@ class AutoExecutor:
             if self.active >= self.config.max_concurrent:
                 return False
             self.active += 1
+        worker = None
         try:
-            t = threading.Thread(target=self._run, args=(msg, on_done), daemon=True)
-            t.start()
+            worker = threading.Thread(target=self._run, args=(msg, on_done), daemon=True)
+            with self.lock:
+                self.workers[worker] = msg.get("msg_id", "(unknown)")
+            worker.start()
             return True
         except Exception as exc:
             with self.lock:
                 self.active -= 1
+                if worker is not None:
+                    self.workers.pop(worker, None)
             try:
                 self.logger.error(f"AUTO-EXEC could not start worker: {exc}")
             except Exception:
                 pass
-            self._call_on_done(on_done, False)
-            return False
+            return WORKER_START_FAILED
+
+    def wait_for_workers(self, timeout):
+        """Join active workers for at most timeout seconds and return their IDs."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self.lock:
+            workers = list(self.workers.items())
+        for worker, _msg_id in workers:
+            remaining = max(0.0, deadline - time.monotonic())
+            worker.join(remaining)
+        with self.lock:
+            return [msg_id for worker, msg_id in self.workers.items() if worker.is_alive()]
 
     def _call_on_done(self, on_done, success):
         if on_done is None:
@@ -805,6 +912,7 @@ class AutoExecutor:
         finally:
             with self.lock:
                 self.active = max(0, self.active - 1)
+                self.workers.pop(threading.current_thread(), None)
             self._call_on_done(on_done, success)
 
     def _log_to_vault(self, task, result, success, duration, model, budget):
@@ -845,13 +953,19 @@ class RelayDaemon:
     def __init__(self, config):
         self.config = config
         self.logger = self._setup_logging()
-        self.store = RelayStore(config.state_dir)
+        # The DB is opened only after acquiring relay.lock in run(). A second
+        # daemon must not touch SQLite before it discovers the active instance.
+        self.store = None
         self.rate_limiter = RateLimiter()
-        self.executor = AutoExecutor(config, self.logger, store=self.store)
+        self.executor = AutoExecutor(config, self.logger)
         self.shutdown_event = None  # Created in run() to bind to correct loop
         self.start_time = time.time()
         self.stats = {"tcp_received": 0, "tcp_sent": 0, "file_received": 0, "file_sent": 0}
         self._queue_logged = set()
+        self._store_full_logged = False
+        self._lock_fd = None
+        self._closing = False
+        self._lifecycle_lock = threading.Lock()
 
     def _setup_logging(self):
         logger = logging.getLogger("relay")
@@ -869,6 +983,37 @@ class RelayDaemon:
         logger.addHandler(ch)
 
         return logger
+
+    def _acquire_instance_lock(self):
+        state_dir = Path(self.config.state_dir).expanduser()
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(state_dir, 0o700)
+        lock_path = state_dir / "relay.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.chmod(lock_path, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            raise
+        self._lock_fd = fd
+        return True
+
+    def _release_instance_lock(self):
+        if self._lock_fd is None:
+            return
+        fd, self._lock_fd = self._lock_fd, None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _log_store_full_once(self, exc):
+        if not self._store_full_logged:
+            self.logger.error(f"Relay store is full; refusing new messages: {exc}")
+            self._store_full_logged = True
 
     # ── TCP Server ──
 
@@ -917,13 +1062,27 @@ class RelayDaemon:
                 await writer.wait_closed()
                 return
 
+            try:
+                validate_inbound_message(message)
+            except ValueError as exc:
+                self.logger.warning(f"Invalid signed message from {peer_ip}: {exc}")
+                resp = {"status": "error", "error": str(exc)}
+                writer.write(frame_and_encode(resp))
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+
             msg_id = message.get("msg_id", "")
             message_without_signature = dict(message)
             message_without_signature.pop("signature", None)
             try:
                 is_new = self.store.enqueue(msg_id, message_without_signature, "tcp")
             except Exception as exc:
-                self.logger.error(f"Failed to durably enqueue TCP message {msg_id}: {exc}")
+                if isinstance(exc, StoreFullError):
+                    self._log_store_full_once(exc)
+                else:
+                    self.logger.error(f"Failed to durably enqueue TCP message {msg_id}: {exc}")
                 resp = {"status": "error", "error": "enqueue failed", "msg_id": msg_id}
                 writer.write(frame_and_encode(resp))
                 await writer.drain()
@@ -963,10 +1122,11 @@ class RelayDaemon:
 
     def _write_held_file(self, msg_id, message, reason):
         held_dir = self.config.state_dir / "held"
+        existed = held_dir.exists()
         held_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(held_dir, 0o700)
         held_path = held_dir / f"{msg_id}.json"
-        record = dict(message)
+        record = dict(message) if isinstance(message, dict) else {"payload": message}
         record["held_reason"] = reason
         record["held_at"] = time.time()
         tmp_path = held_dir / f".{msg_id}.{uuid.uuid4().hex}.tmp"
@@ -977,7 +1137,9 @@ class RelayDaemon:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(tmp_path, held_path)
-            os.chmod(held_path, 0o600)
+            _fsync_directory(held_dir)
+            if not existed:
+                _fsync_directory(self.config.state_dir)
         finally:
             try:
                 tmp_path.unlink()
@@ -985,29 +1147,57 @@ class RelayDaemon:
                 pass
         return held_path
 
-    def _hold_message(self, msg_id, message, reason):
+    def _hold_message(self, msg_id, message, reason, expected_state=None):
+        row = self.store.get(msg_id)
+        if not row:
+            return False
+        if row["state"] == "held":
+            self._queue_logged.discard(msg_id)
+            return False
+        expected_state = expected_state or row["state"]
+        if row["state"] != expected_state:
+            return False
+        if not self.store.set_state(msg_id, "held", expected_state, reason=reason):
+            return False
+        self._queue_logged.discard(msg_id)
+        held_row = self.store.get(msg_id)
+        payload = held_row.get("payload") if held_row else message
         try:
-            held_path = self._write_held_file(msg_id, message, reason)
+            held_path = self._write_held_file(msg_id, payload, reason)
+            self.store.mark_held_written(msg_id)
             if reason == "AUTO-EXEC disabled; manual pickup required":
                 self.logger.warning(
                     f"AUTO-EXEC disabled (auto_execute.enabled is not true): held for manual pickup: {held_path}"
                 )
             else:
                 self.logger.warning(f"AUTO-EXEC held for manual pickup: {held_path} ({reason})")
-        except OSError as exc:
+        except Exception as exc:
             self.logger.error(f"Could not write held message {msg_id}: {exc}")
-        self.store.set_state(msg_id, "held")
+        return True
+
+    def _ensure_held_files(self):
+        for row in self.store.list_state("held"):
+            msg_id = row["msg_id"]
+            held_path = self.config.state_dir / "held" / f"{msg_id}.json"
+            if row.get("held_written") and held_path.is_file():
+                continue
+            payload = row.get("payload")
+            if payload is None:
+                self.logger.error(f"Held message {msg_id} has no DB payload for file recovery")
+                continue
+            try:
+                self._write_held_file(msg_id, payload, row.get("held_reason") or "held")
+                self.store.mark_held_written(msg_id)
+            except Exception as exc:
+                self.logger.error(f"Could not retry held message {msg_id}: {exc}")
 
     def recover_interrupted(self):
         """Never retry tasks whose worker may have started before a crash."""
         for row in self.store.list_state("executing"):
             reason = "interrupted during execution; not re-run automatically"
-            try:
-                self._write_held_file(row["msg_id"], row.get("payload") or {}, reason)
-            except OSError as exc:
-                self.logger.error(f"Could not write recovery hold for {row['msg_id']}: {exc}")
-            self.store.set_state(row["msg_id"], "held")
-            self.logger.warning(f"Recovered interrupted execution as held: {row['msg_id']}")
+            if self._hold_message(row["msg_id"], row.get("payload") or {}, reason,
+                                  expected_state="executing"):
+                self.logger.warning(f"Recovered interrupted execution as held: {row['msg_id']}")
 
     def _is_auto_message(self, message):
         tags = message.get("tags", [])
@@ -1020,16 +1210,18 @@ class RelayDaemon:
         if not row or row["state"] != "queued":
             return
         message = row.get("payload") or {}
+        validate_inbound_message(message)
         if not self._is_auto_message(message):
             sender = message.get("from", "unknown")
             body = message.get("body", message.get("message", "(empty)"))
             play_alert(self.config.platform)
             self.logger.info(f"Message from {sender}: {body[:200]}")
-            self.store.set_state(msg_id, "done")
+            self.store.set_state(msg_id, "done", expected_state="queued")
             return
 
-        if self.config.auto_execute_enabled is not True:
-            self._hold_message(msg_id, message, "AUTO-EXEC disabled; manual pickup required")
+        if getattr(self.config, "auto_execute_enabled", False) is not True:
+            self._hold_message(msg_id, message, "AUTO-EXEC disabled; manual pickup required",
+                               expected_state="queued")
             return
 
         try:
@@ -1037,7 +1229,8 @@ class RelayDaemon:
         except (TypeError, ValueError):
             max_queue_age = 3600.0
         if time.time() - row["received_at"] > max_queue_age:
-            self._hold_message(msg_id, message, "AUTO-EXEC queue age exceeded; manual pickup required")
+            self._hold_message(msg_id, message, "AUTO-EXEC queue age exceeded; manual pickup required",
+                               expected_state="queued")
             return
 
         if not self.executor.can_accept():
@@ -1047,30 +1240,47 @@ class RelayDaemon:
                 self._queue_logged.add(msg_id)
             return
 
-        self.store.set_state(msg_id, "executing")
+        if not self.store.set_state(msg_id, "executing", expected_state="queued"):
+            return
 
         def on_done(success):
-            self.store.set_state(msg_id, "done" if success else "failed")
-            self._queue_logged.discard(msg_id)
+            with self._lifecycle_lock:
+                if self._closing:
+                    return
+                if self.store.set_state(msg_id, "done" if success else "failed",
+                                        expected_state="executing"):
+                    self._queue_logged.discard(msg_id)
 
         try:
-            accepted = self.executor.execute(message, on_done=on_done)
-            if not accepted:
-                current = self.store.get(msg_id)
-                if current and current["state"] == "executing":
-                    self.store.set_state(msg_id, "queued")
+            result = self.executor.execute(message, on_done=on_done)
+            if result is WORKER_START_FAILED or not result:
+                if self.store.set_state(msg_id, "queued", expected_state="executing"):
+                    self._queue_logged.discard(msg_id)
         except Exception as exc:
             self.logger.error(f"Could not start queued execution {msg_id}: {exc}")
             current = self.store.get(msg_id)
             if current and current["state"] == "executing":
-                self.store.set_state(msg_id, "failed")
+                self._hold_message(msg_id, current.get("payload") or {}, "dispatch-error",
+                                   expected_state="executing")
 
     async def drain_queued(self):
         last_prune = 0.0
         while not self.shutdown_event.is_set():
             try:
+                self._ensure_held_files()
                 for row in self.store.list_state("queued"):
-                    self._dispatch(row["msg_id"])
+                    try:
+                        self._dispatch(row["msg_id"])
+                    except Exception as exc:
+                        self.logger.error(f"Dispatch failed for {row['msg_id']}: {exc}")
+                        current = self.store.get(row["msg_id"])
+                        if current and current["state"] in ("queued", "executing"):
+                            try:
+                                self._hold_message(row["msg_id"], current.get("payload"),
+                                                   "dispatch-error", expected_state=current["state"])
+                            except Exception as hold_exc:
+                                self.logger.error(f"Could not hold dispatch failure {row['msg_id']}: {hold_exc}")
+                        self._queue_logged.discard(row["msg_id"])
                 now = time.monotonic()
                 if now - last_prune >= 60.0:
                     self.store.prune()
@@ -1108,7 +1318,8 @@ class RelayDaemon:
                 target = request.get("target")
                 message = request.get("message", {})
                 result = await self._send_to_target(target, message)
-                resp = {"status": "ok", "delivery": result}
+                status = "error" if result.get("method") == "error" else "ok"
+                resp = {"status": status, "delivery": result}
             elif cmd == "check":
                 resp = self._check_file_inbox()
             elif cmd == "read":
@@ -1194,7 +1405,22 @@ class RelayDaemon:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = f"{ts}-{self.config.machine}.json"
         filepath = inbox_path / filename
-        filepath.write_text(json.dumps(message, indent=2))
+        if filepath.exists():
+            filepath = inbox_path / f"{filepath.stem}-{uuid.uuid4().hex}.json"
+        tmp_path = inbox_path / f".{filepath.name}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(message, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp_path, filepath)
+            _fsync_directory(inbox_path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _ssh_deliver(self, target, local_inbox, message):
         """Try SSH/scp delivery as additional file transport."""
@@ -1272,11 +1498,19 @@ class RelayDaemon:
     async def _process_file_message(self, msg_path):
         """Process a file-based message."""
         try:
-            if msg_path.stat().st_size > MAX_MESSAGE_SIZE:
+            file_stat = msg_path.stat()
+            if file_stat.st_size > MAX_MESSAGE_SIZE:
                 self._reject_file(msg_path, "too-large")
                 return "rejected"
             msg = json.loads(msg_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
+            try:
+                age = time.time() - file_stat.st_mtime
+            except (UnboundLocalError, OSError):
+                age = FILE_DECODE_GRACE
+            if age < FILE_DECODE_GRACE:
+                self.logger.info(f"File message {msg_path.name} is incomplete; retrying later")
+                return "retry"
             self._reject_file(msg_path, "bad-json")
             return "rejected"
         except OSError as exc:
@@ -1293,13 +1527,22 @@ class RelayDaemon:
             self._reject_file(msg_path, self._file_verification_reason(msg))
             return "rejected"
 
+        try:
+            validate_inbound_message(msg)
+        except ValueError as exc:
+            self._reject_file(msg_path, f"invalid-message: {exc}")
+            return "rejected"
+
         msg_id = msg["msg_id"]
         message_without_signature = dict(msg)
         message_without_signature.pop("signature", None)
         try:
             is_new = self.store.enqueue(msg_id, message_without_signature, "file")
         except Exception as exc:
-            self.logger.error(f"Failed to durably enqueue file message {msg_path.name}: {exc}")
+            if isinstance(exc, StoreFullError):
+                self._log_store_full_once(exc)
+            else:
+                self.logger.error(f"Failed to durably enqueue file message {msg_path.name}: {exc}")
             return "retry"
 
         self._archive_file(msg_path)
@@ -1326,10 +1569,22 @@ class RelayDaemon:
         self.logger.warning(f"Rejected file message {msg_path.name}: {reason}")
         try:
             root = self.config._get_file_root() or msg_path.parent.parent
-            rejected = root / "rejected"
+            hostname = socket.gethostname()
+            hostname = re.sub(r"[^A-Za-z0-9._-]", "_", hostname) or "unknown"
+            rejected = root / "rejected" / hostname
             rejected.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(rejected, 0o700)
-            msg_path.rename(rejected / msg_path.name)
+            target = rejected / msg_path.name
+            if target.exists():
+                target = rejected / f"{msg_path.stem}-{uuid.uuid4().hex}{msg_path.suffix}"
+            try:
+                os.link(msg_path, target)
+                msg_path.unlink()
+            except OSError:
+                if target.exists():
+                    target = rejected / f"{msg_path.stem}-{uuid.uuid4().hex}{msg_path.suffix}"
+                msg_path.rename(target)
+            _fsync_directory(rejected)
         except OSError:
             # The watcher's seen set prevents repeated logs while the source remains.
             pass
@@ -1433,74 +1688,92 @@ class RelayDaemon:
         """Start all daemon components."""
         self.shutdown_event = asyncio.Event()
         self.logger.info(f"Relay daemon v{VERSION} starting on {self.config.machine}")
+        if not self._acquire_instance_lock():
+            self.logger.error("Another relay instance holds relay.lock; exiting")
+            raise SystemExit(1)
 
-        self.store.prune()
-        self.recover_interrupted()
-
-        if not self.config.tailscale_ip:
-            self.logger.error("Cannot determine Tailscale IP — aborting")
-            return
-
-        if not self.config.secret:
-            self.logger.error("No shared secret configured — all inbound messages will be refused and all outbound sends will fail")
-
-        # Set up signal handlers
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda s=sig: self.shutdown_event.set())
-
-        # Clean up stale socket
+        tcp_server = None
+        uds_server = None
+        watcher_task = None
+        drain_task = None
         sock_path = Path(self.config.socket_path)
-        if sock_path.exists():
-            sock_path.unlink()
-
-        # Start TCP server
-        tcp_server = await asyncio.start_server(
-            self.handle_tcp_client,
-            self.config.tailscale_ip,
-            self.config.port,
-        )
-        self.logger.info(f"TCP server listening on {self.config.tailscale_ip}:{self.config.port}")
-
-        # Start Unix socket server
-        uds_server = await asyncio.start_unix_server(
-            self.handle_uds_client,
-            path=self.config.socket_path,
-        )
-        os.chmod(self.config.socket_path, 0o600)
-        self.logger.info(f"UDS server listening on {self.config.socket_path}")
-
-        # Start file watcher
-        watcher_task = asyncio.create_task(self.watch_file_inbox())
-        drain_task = asyncio.create_task(self.drain_queued())
-
-        self.logger.info("Daemon ready")
-
-        # Wait for shutdown
-        await self.shutdown_event.wait()
-
-        self.logger.info("Shutting down...")
-        tcp_server.close()
-        await tcp_server.wait_closed()
-        uds_server.close()
-        await uds_server.wait_closed()
-        watcher_task.cancel()
-        drain_task.cancel()
+        owns_socket = False
         try:
-            await watcher_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await drain_task
-        except asyncio.CancelledError:
-            pass
+            self.store = RelayStore(self.config.state_dir)
+            self.executor.store = self.store
+            enabled = getattr(self.config, "auto_execute_enabled", False) is True
+            self.logger.info(f"Effective auto_execute.enabled={enabled}")
 
-        # Clean up socket
-        if sock_path.exists():
-            sock_path.unlink()
+            self.recover_interrupted()
+            self._ensure_held_files()
+            self.store.prune()
 
-        self.store.close()
-        self.logger.info("Shutdown complete")
+            if not self.config.tailscale_ip:
+                self.logger.error("Cannot determine Tailscale IP — aborting")
+                return
+
+            if not self.config.secret:
+                self.logger.error("No shared secret configured — all inbound messages will be refused and all outbound sends will fail")
+
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, lambda s=sig: self.shutdown_event.set())
+
+            if sock_path.exists():
+                sock_path.unlink()
+
+            tcp_server = await asyncio.start_server(
+                self.handle_tcp_client,
+                self.config.tailscale_ip,
+                self.config.port,
+            )
+            self.logger.info(f"TCP server listening on {self.config.tailscale_ip}:{self.config.port}")
+
+            uds_server = await asyncio.start_unix_server(
+                self.handle_uds_client,
+                path=self.config.socket_path,
+            )
+            owns_socket = True
+            os.chmod(self.config.socket_path, 0o600)
+            self.logger.info(f"UDS server listening on {self.config.socket_path}")
+
+            watcher_task = asyncio.create_task(self.watch_file_inbox())
+            drain_task = asyncio.create_task(self.drain_queued())
+            self.logger.info("Daemon ready")
+            await self.shutdown_event.wait()
+        finally:
+            self.logger.info("Shutting down...")
+            for server in (tcp_server, uds_server):
+                if server is not None:
+                    server.close()
+            for server in (tcp_server, uds_server):
+                if server is not None:
+                    await server.wait_closed()
+            tasks = [task for task in (watcher_task, drain_task) if task is not None]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            try:
+                timeout = min(max(0.0, float(self.config.exec_timeout)), 30.0)
+            except (AttributeError, TypeError, ValueError):
+                timeout = min(EXECUTION_TIMEOUT, 30.0)
+            in_flight = self.executor.wait_for_workers(timeout)
+            if in_flight:
+                self.logger.error(f"AUTO-EXEC workers still in flight at shutdown: {', '.join(in_flight)}")
+
+            try:
+                with self._lifecycle_lock:
+                    self._closing = True
+                    if owns_socket and sock_path.exists():
+                        sock_path.unlink()
+                    if self.store is not None:
+                        self.store.close()
+                        self.store = None
+            finally:
+                self._release_instance_lock()
+            self.logger.info("Shutdown complete")
 
 
 # ── CLI Client ──
