@@ -153,10 +153,10 @@ class BackgroundRouteTests(_RouteCase):
 
     def test_build_claude_cmd(self):
         self.assertEqual(relay.build_claude_cmd("claude", "claude-sonnet-5", 1.0, "t"),
-                         ["claude", "--model", "claude-sonnet-5", "--max-budget-usd", "1.0", "-p", "t"])
+                         ["claude", "--model", "claude-sonnet-5", "--max-budget-usd", "1.0", "-p", "--", "t"])
         self.assertEqual(relay.build_claude_cmd("claude", "m", 2.0, "t", "low", "f"),
                          ["claude", "--model", "m", "--effort", "low", "--fallback-model", "f",
-                          "--max-budget-usd", "2.0", "-p", "t"])
+                          "--max-budget-usd", "2.0", "-p", "--", "t"])
 
 
 class AutoExecutorModelTests(_RouteCase):
