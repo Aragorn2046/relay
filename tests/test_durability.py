@@ -156,6 +156,60 @@ def test_signed_replay_is_deduped_after_restart(tmp_path):
         restarted.close()
 
 
+def test_uds_cli_repeated_msg_id_is_stored_once(tmp_path, monkeypatch):
+    sender = make_daemon(tmp_path / "sender", open_store=False)
+    receiver = make_daemon(tmp_path / "receiver")
+    receiver.config.machine = "receiver-host"
+    sender.config.tailscale_ip = "127.0.0.1"
+    sender.config.port = 0
+    sender.config.socket_path = str(Path.cwd() / ".relay-test-uds-dedupe.sock")
+    monkeypatch.setattr(sender, "watch_file_inbox", lambda: asyncio.Event().wait())
+    monkeypatch.setattr(sender, "drain_queued", lambda: asyncio.Event().wait())
+
+    async def send_to_receiver(_target, message):
+        signed = relay.sign_message(dict(message), receiver.config.secret)
+        writer = FakeWriter()
+        request = relay.frame_message(json.dumps(signed).encode("utf-8"))
+        await receiver.handle_tcp_client(FakeReader(request), writer)
+        response = decode_response(writer)
+        return {"method": "tcp", "msg_id": response.get("msg_id")}
+
+    sender._send_to_target = send_to_receiver
+
+    async def exercise():
+        run_task = asyncio.create_task(sender.run())
+        deadline = time.monotonic() + 3
+        while not Path(sender.config.socket_path).exists():
+            if time.monotonic() >= deadline:
+                raise AssertionError("sender UDS socket did not start")
+            await asyncio.sleep(0.01)
+        for _ in range(2):
+            await asyncio.to_thread(
+                relay.cli_send_via_daemon,
+                sender.config.socket_path,
+                "receiver-host",
+                "same message",
+                sender.config.machine,
+                False,
+                1.0,
+                None,
+                "duplicate-uds-msg-id",
+            )
+        sender.shutdown_event.set()
+        await asyncio.wait_for(run_task, timeout=4)
+
+    try:
+        asyncio.run(exercise())
+        assert sum(receiver.store.counts().values()) == 1
+        row = receiver.store.get("duplicate-uds-msg-id")
+        assert row is not None
+        assert row["msg_id"] == "duplicate-uds-msg-id"
+    finally:
+        if sender.store is not None:
+            sender.store.close()
+        receiver.store.close()
+
+
 def test_store_full_log_flag_resets_after_successful_tcp_enqueue(tmp_path, monkeypatch):
     daemon = make_daemon(tmp_path)
     try:
@@ -717,6 +771,7 @@ def test_shutdown_persists_blocked_reply_and_startup_resends_once(tmp_path, monk
         retry_daemon.config.tailscale_ip = "127.0.0.1"
         retried_commands = []
         startup_events = []
+        reply_started = threading.Event()
 
         class RetryServer:
             def close(self):
@@ -735,6 +790,7 @@ def test_shutdown_persists_blocked_reply_and_startup_resends_once(tmp_path, monk
             return RetryServer()
 
         async def stop_retry_run():
+            assert await asyncio.wait_for(asyncio.to_thread(reply_started.wait), timeout=2)
             retry_daemon.shutdown_event.set()
 
         async def idle_retry_drain():
@@ -742,6 +798,7 @@ def test_shutdown_persists_blocked_reply_and_startup_resends_once(tmp_path, monk
 
         def successful_popen(cmd, **kwargs):
             startup_events.append("reply")
+            reply_started.set()
             retried_commands.append((cmd, kwargs))
             return SuccessfulReply()
 
@@ -756,11 +813,202 @@ def test_shutdown_persists_blocked_reply_and_startup_resends_once(tmp_path, monk
         assert "send" in retried_commands[0][0]
         assert "child result" in retried_commands[0][0][-1]
         assert retried_commands[0][0][4] == "--msg-id"
-        assert retried_commands[0][0][5] == relay._reply_msg_id(message["msg_id"])
+        assert retried_commands[0][0][5] == relay._reply_msg_id(
+            retry_daemon.config.machine, message["msg_id"]
+        )
         assert retried_commands[0][1]["start_new_session"] is True
         assert startup_events.index("tcp") < startup_events.index("reply")
         assert startup_events.index("uds") < startup_events.index("reply")
         assert not pending_path.exists()
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
+        daemon._release_instance_lock()
+
+
+def test_startup_resend_runs_off_loop_and_keeps_uds_responsive(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path, open_store=False)
+    daemon.config.tailscale_ip = "127.0.0.1"
+    daemon.config.port = 0
+    daemon.config.socket_path = str(Path.cwd() / ".relay-test-uds-resend.sock")
+    pending_path = daemon.executor._persist_reply_pending(
+        {"msg_id": "uds-resend-live", "from": "sender", "body": "task"},
+        "result",
+        True,
+    )
+    resend_started = threading.Event()
+    helper_uds_completed = threading.Event()
+    allow_resend_to_finish = threading.Event()
+    resend_finished = threading.Event()
+    resend_thread_ids = []
+
+    async def idle():
+        await asyncio.Event().wait()
+
+    def send_result_via_uds(_message, _result, _success):
+        resend_thread_ids.append(threading.get_ident())
+        resend_started.set()
+        response = relay._uds_request(
+            daemon.config.socket_path,
+            {"cmd": "health"},
+            timeout=2.0,
+        )
+        if not response or response.get("status") != "ok":
+            return relay.ReplySendResult(delivered=False, started=True)
+        helper_uds_completed.set()
+        if not allow_resend_to_finish.wait(timeout=3):
+            return relay.ReplySendResult(delivered=False, started=True)
+        resend_finished.set()
+        return relay.ReplySendResult(delivered=True, started=True)
+
+    daemon.executor._send_result_back = send_result_via_uds
+    monkeypatch.setattr(daemon, "watch_file_inbox", idle)
+    monkeypatch.setattr(daemon, "drain_queued", idle)
+
+    async def ask_health():
+        reader, writer = await asyncio.open_unix_connection(daemon.config.socket_path)
+        writer.write(relay.frame_and_encode({"cmd": "health"}))
+        await writer.drain()
+        response = json.loads(await relay.read_framed(reader, timeout=2.0))
+        writer.close()
+        await writer.wait_closed()
+        return response
+
+    async def exercise():
+        loop_thread_id = threading.get_ident()
+        run_task = asyncio.create_task(daemon.run())
+        deadline = time.monotonic() + 3
+        while not Path(daemon.config.socket_path).exists():
+            if time.monotonic() >= deadline:
+                raise AssertionError("daemon UDS socket did not start")
+            await asyncio.sleep(0.01)
+
+        assert await asyncio.wait_for(asyncio.to_thread(resend_started.wait), timeout=2)
+        assert await asyncio.wait_for(asyncio.to_thread(helper_uds_completed.wait), timeout=2)
+        assert resend_thread_ids[0] != loop_thread_id
+        response = await ask_health()
+        assert response["status"] == "ok"
+
+        allow_resend_to_finish.set()
+        assert await asyncio.wait_for(asyncio.to_thread(resend_finished.wait), timeout=2)
+        deadline = time.monotonic() + 2
+        while pending_path.exists():
+            if time.monotonic() >= deadline:
+                raise AssertionError("resend did not remove the delivered pending record")
+            await asyncio.sleep(0.01)
+        daemon.shutdown_event.set()
+        await asyncio.wait_for(run_task, timeout=4)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
+        daemon._release_instance_lock()
+
+
+def test_child_finishing_during_graceful_shutdown_reports_done_and_persists_reply(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path, enabled=True, open_store=False)
+    daemon.config.tailscale_ip = "127.0.0.1"
+    daemon.config.port = 0
+    daemon.config.socket_path = str(Path.cwd() / ".relay-test-uds-shutdown.sock")
+    child_started = threading.Event()
+    uds_closed = threading.Event()
+    completion_lock_checks = []
+    real_start_unix_server = relay.asyncio.start_unix_server
+    original_call_on_done = daemon.executor._call_on_done
+
+    class ClosingSignalServer:
+        def __init__(self, server):
+            self.server = server
+
+        def close(self):
+            self.server.close()
+            uds_closed.set()
+
+        async def wait_closed(self):
+            await self.server.wait_closed()
+
+    class SuccessfulOnUdsClose:
+        pid = 515151
+
+        def __init__(self):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            child_started.set()
+            if not uds_closed.wait(timeout):
+                raise relay.subprocess.TimeoutExpired("stub-worker", timeout)
+            self.returncode = 0
+            return "child finished", ""
+
+        def wait(self, timeout=None):
+            if not uds_closed.wait(timeout):
+                raise relay.subprocess.TimeoutExpired("stub-worker", timeout)
+            self.returncode = 0
+            return 0
+
+    async def tracking_start_unix_server(*args, **kwargs):
+        server = await real_start_unix_server(*args, **kwargs)
+        return ClosingSignalServer(server)
+
+    async def launch_worker():
+        message = {
+            "msg_id": "graceful-completion",
+            "from": "sender",
+            "body": "run",
+            "auto_execute": True,
+            "reply_to": "sender",
+        }
+        daemon.store.enqueue(message["msg_id"], message, "test")
+        daemon._dispatch(message["msg_id"])
+        await asyncio.Event().wait()
+
+    async def idle():
+        await asyncio.Event().wait()
+
+    def check_unlocked_callback(on_done, success):
+        acquired = daemon.executor.lock.acquire(blocking=False)
+        completion_lock_checks.append(acquired)
+        if acquired:
+            daemon.executor.lock.release()
+        return original_call_on_done(on_done, success)
+
+    monkeypatch.setattr(relay.asyncio, "start_unix_server", tracking_start_unix_server)
+    monkeypatch.setattr(daemon, "watch_file_inbox", launch_worker)
+    monkeypatch.setattr(daemon, "drain_queued", idle)
+    monkeypatch.setattr(relay, "resolve_background_route", lambda *_args, **_kwargs: {
+        "rows": [("test-model", "")], "source": "test",
+    })
+    monkeypatch.setattr(relay, "pick_route_row", lambda *_args: ("test-model", "", None))
+    monkeypatch.setattr(relay.shutil, "which", lambda *_args, **_kwargs: "/usr/bin/claude")
+    monkeypatch.setattr(relay, "build_claude_cmd", lambda *_args, **_kwargs: ["stub-worker"])
+    monkeypatch.setattr(relay, "play_exec_alert", lambda _platform: None)
+    monkeypatch.setattr(relay.subprocess, "Popen", lambda *_args, **_kwargs: SuccessfulOnUdsClose())
+    daemon.executor._call_on_done = check_unlocked_callback
+
+    async def exercise():
+        run_task = asyncio.create_task(daemon.run())
+        assert await asyncio.wait_for(asyncio.to_thread(child_started.wait), timeout=3)
+        daemon.shutdown_event.set()
+        await asyncio.wait_for(run_task, timeout=5)
+
+    try:
+        asyncio.run(exercise())
+        assert uds_closed.is_set()
+        assert completion_lock_checks == [True]
+        pending_path = daemon.config.state_dir / "held" / "graceful-completion.reply-pending.json"
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        assert pending["result"] == "child finished"
+        assert pending["success"] is True
+        reopened = relay.RelayStore(daemon.config.state_dir)
+        try:
+            assert reopened.get("graceful-completion")["state"] == "done"
+        finally:
+            reopened.close()
     finally:
         if daemon.store is not None:
             daemon.store.close()
@@ -784,6 +1032,48 @@ def test_pending_reply_deadletters_after_three_started_attempts(tmp_path):
     assert dead["attempts"] == 3
     assert not pending_path.exists()
     assert daemon.executor._send_result_back.call_count == 3
+
+
+def test_invalid_pending_reply_is_dead_lettered(tmp_path):
+    daemon = make_daemon(tmp_path, open_store=False)
+    held_dir = daemon.config.state_dir / "held"
+    held_dir.mkdir(parents=True)
+    pending_path = held_dir / "invalid-pending.reply-pending.json"
+    pending_path.write_text('{"msg_id": "invalid-pending", "attempts": -1}', encoding="utf-8")
+
+    daemon.executor.resend_pending_replies()
+
+    assert not pending_path.exists()
+    assert (held_dir / "invalid-pending.reply-dead.json").is_file()
+    assert "Dead-lettered invalid pending AUTO-EXEC reply" in str(daemon.logger.error.call_args)
+
+
+def test_pending_reply_whose_helper_cannot_start_is_dead_lettered(tmp_path):
+    daemon = make_daemon(tmp_path, open_store=False)
+    original = {"msg_id": "no-helper-start", "from": "sender", "body": "task"}
+    pending_path = daemon.executor._persist_reply_pending(original, "result", True)
+    daemon.executor._send_result_back = mock.Mock(
+        return_value=relay.ReplySendResult(delivered=False, started=False)
+    )
+
+    daemon.executor.resend_pending_replies()
+
+    dead_path = daemon.config.state_dir / "held" / "no-helper-start.reply-dead.json"
+    assert not pending_path.exists()
+    assert dead_path.is_file()
+    daemon.executor._send_result_back.assert_called_once()
+
+
+def test_missing_original_msg_id_is_rejected_for_reply_and_persistence(tmp_path):
+    daemon = make_daemon(tmp_path, open_store=False)
+    missing_id = {"from": "sender", "body": "task"}
+
+    assert daemon.executor._persist_reply_pending(missing_id, "result", True) is None
+    result = daemon.executor._send_result_back(missing_id, "result", True)
+
+    assert result == relay.ReplySendResult(delivered=False, started=False)
+    assert not (daemon.config.state_dir / "held" / "unknown.reply-pending.json").exists()
+    assert "Message ID is invalid" in str(daemon.logger.error.call_args_list)
 
 
 @pytest.mark.parametrize("msg_id", ["..", "../escape", "x" * 129])
@@ -960,6 +1250,14 @@ def test_legacy_held_rows_migrate_as_already_picked_up(tmp_path, has_file):
         assert daemon.store.get("legacy-held")["held_written"] == 1
         daemon._ensure_held_files()
         assert held_path.exists() is has_file
+        if not has_file:
+            daemon._ensure_held_files()
+            held_warnings = [
+                call for call in daemon.logger.warning.call_args_list
+                if "Legacy held messages have no pickup file" in str(call)
+            ]
+            assert len(held_warnings) == 1
+            assert "legacy-held" in str(held_warnings[0])
 
         daemon.store.close()
         daemon.store = relay.RelayStore(state_dir, logger=daemon.logger)
@@ -1006,6 +1304,7 @@ def test_user_version_zero_preserves_and_retries_existing_held_written_column(tm
 
         # run() performs the held-file retry before it checks whether the daemon
         # can bind its configured Tailscale address.
+        daemon.config.tailscale_ip = None
         asyncio.run(daemon.run())
         restarted = relay.RelayStore(state_dir)
         try:
