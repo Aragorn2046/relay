@@ -1015,6 +1015,108 @@ def test_child_finishing_during_graceful_shutdown_reports_done_and_persists_repl
         daemon._release_instance_lock()
 
 
+def test_child_exiting_zero_after_sigterm_reports_done(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path, enabled=True, open_store=False)
+    daemon.config.tailscale_ip = "127.0.0.1"
+    daemon.config.port = 0
+    daemon.config.exec_timeout = 60
+    daemon.config.socket_path = str(tmp_path / "sigterm-success.sock")
+    child_started = threading.Event()
+    term_sent = threading.Event()
+    exit_allowed = threading.Event()
+    child_reaped = threading.Event()
+
+    class FakeServer:
+        def close(self):
+            return None
+
+        async def wait_closed(self):
+            return None
+
+    class SuccessfulAfterTerm:
+        pid = 525252
+
+        def __init__(self):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            child_started.set()
+            if not term_sent.wait(timeout):
+                raise relay.subprocess.TimeoutExpired("stub-worker", timeout)
+            if not exit_allowed.wait(timeout):
+                raise relay.subprocess.TimeoutExpired("stub-worker", timeout)
+            self.returncode = 0
+            child_reaped.set()
+            return "child finished", ""
+
+        def wait(self, timeout=None):
+            exit_allowed.set()
+            if not child_reaped.wait(timeout):
+                raise relay.subprocess.TimeoutExpired("stub-worker", timeout)
+            return self.returncode
+
+    async def fake_start_server(*_args, **_kwargs):
+        return FakeServer()
+
+    async def fake_start_unix_server(*_args, **kwargs):
+        Path(kwargs["path"]).touch()
+        return FakeServer()
+
+    async def launch_worker():
+        message = {
+            "msg_id": "sigterm-success",
+            "from": "sender",
+            "body": "run",
+            "auto_execute": True,
+        }
+        daemon.store.enqueue(message["msg_id"], message, "test")
+        daemon._dispatch(message["msg_id"])
+        await asyncio.Event().wait()
+
+    async def idle():
+        await asyncio.Event().wait()
+
+    def fake_killpg(_pid, signum):
+        if signum == relay.signal.SIGTERM:
+            term_sent.set()
+
+    monkeypatch.setattr(relay.asyncio, "start_server", fake_start_server)
+    monkeypatch.setattr(relay.asyncio, "start_unix_server", fake_start_unix_server)
+    monkeypatch.setattr(daemon, "watch_file_inbox", launch_worker)
+    monkeypatch.setattr(daemon, "drain_queued", idle)
+    monkeypatch.setattr(relay, "resolve_background_route", lambda *_args, **_kwargs: {
+        "rows": [("test-model", "")], "source": "test",
+    })
+    monkeypatch.setattr(relay, "pick_route_row", lambda *_args: ("test-model", "", None))
+    monkeypatch.setattr(relay.shutil, "which", lambda *_args, **_kwargs: "/usr/bin/claude")
+    monkeypatch.setattr(relay, "build_claude_cmd", lambda *_args, **_kwargs: ["stub-worker"])
+    monkeypatch.setattr(relay, "play_exec_alert", lambda _platform: None)
+    monkeypatch.setattr(relay.subprocess, "Popen", lambda *_args, **_kwargs: SuccessfulAfterTerm())
+    monkeypatch.setattr(relay.os, "killpg", fake_killpg)
+
+    async def exercise():
+        run_task = asyncio.create_task(daemon.run())
+        assert await asyncio.wait_for(asyncio.to_thread(child_started.wait), timeout=3)
+        daemon.shutdown_event.set()
+        await asyncio.wait_for(run_task, timeout=8)
+
+    try:
+        asyncio.run(exercise())
+        assert term_sent.is_set()
+        recovered = relay.RelayStore(daemon.config.state_dir)
+        try:
+            assert recovered.get("sigterm-success")["state"] == "done"
+        finally:
+            recovered.close()
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
+        daemon._release_instance_lock()
+
+
 def test_pending_reply_deadletters_after_three_started_attempts(tmp_path):
     daemon = make_daemon(tmp_path, open_store=False)
     original = {"msg_id": "retry-limit", "from": "sender", "body": "task"}
@@ -1056,12 +1158,102 @@ def test_pending_reply_whose_helper_cannot_start_is_dead_lettered(tmp_path):
         return_value=relay.ReplySendResult(delivered=False, started=False)
     )
 
+    for expected_attempts in (1, 2):
+        daemon.executor.resend_pending_replies()
+        record = json.loads(pending_path.read_text(encoding="utf-8"))
+        assert record["attempts"] == expected_attempts
+        assert pending_path.exists()
+
     daemon.executor.resend_pending_replies()
 
     dead_path = daemon.config.state_dir / "held" / "no-helper-start.reply-dead.json"
     assert not pending_path.exists()
-    assert dead_path.is_file()
-    daemon.executor._send_result_back.assert_called_once()
+    assert json.loads(dead_path.read_text(encoding="utf-8"))["attempts"] == 3
+    assert daemon.executor._send_result_back.call_count == 3
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("temporary I/O failure"), TimeoutError("temporary timeout"),
+     relay.subprocess.TimeoutExpired("helper", 1)],
+)
+def test_transient_pending_reply_failures_preserve_record(tmp_path, failure):
+    daemon = make_daemon(tmp_path, open_store=False)
+    pending_path = daemon.executor._persist_reply_pending(
+        {"msg_id": "transient-reply", "from": "sender", "body": "task"},
+        "result",
+        True,
+    )
+    original = pending_path.read_bytes()
+    daemon.executor._send_result_back = mock.Mock(side_effect=failure)
+
+    daemon.executor.resend_pending_replies()
+
+    assert pending_path.read_bytes() == original
+    assert not (pending_path.parent / "transient-reply.reply-dead.json").exists()
+
+
+def test_shutdown_resend_preserves_pending_record_and_joins_thread(tmp_path, monkeypatch):
+    daemon = make_daemon(tmp_path, open_store=False)
+    daemon.config.tailscale_ip = "127.0.0.1"
+    daemon.config.port = 0
+    daemon.config.socket_path = str(tmp_path / "resend-shutdown.sock")
+    pending_path = daemon.executor._persist_reply_pending(
+        {"msg_id": "shutdown-resend", "from": "sender", "body": "task"},
+        "result",
+        True,
+    )
+    original = pending_path.read_bytes()
+    helper_started = threading.Event()
+    allow_helper_to_finish = threading.Event()
+
+    class FakeServer:
+        def close(self):
+            return None
+
+        async def wait_closed(self):
+            return None
+
+    async def fake_start_server(*_args, **_kwargs):
+        return FakeServer()
+
+    async def fake_start_unix_server(*_args, **kwargs):
+        Path(kwargs["path"]).touch()
+        return FakeServer()
+
+    async def idle():
+        await asyncio.Event().wait()
+
+    def blocked_send(*_args):
+        helper_started.set()
+        allow_helper_to_finish.wait(timeout=10)
+        return relay.ReplySendResult(delivered=True, started=True)
+
+    daemon.executor._send_result_back = blocked_send
+    monkeypatch.setattr(relay.asyncio, "start_server", fake_start_server)
+    monkeypatch.setattr(relay.asyncio, "start_unix_server", fake_start_unix_server)
+    monkeypatch.setattr(daemon, "watch_file_inbox", idle)
+    monkeypatch.setattr(daemon, "drain_queued", idle)
+
+    async def exercise():
+        run_task = asyncio.create_task(daemon.run())
+        assert await asyncio.wait_for(asyncio.to_thread(helper_started.wait), timeout=3)
+        daemon.shutdown_event.set()
+        assert await asyncio.wait_for(
+            asyncio.to_thread(daemon.executor._resend_stop_event.wait), timeout=2
+        )
+        allow_helper_to_finish.set()
+        await asyncio.wait_for(run_task, timeout=5)
+
+    try:
+        asyncio.run(exercise())
+        assert pending_path.read_bytes() == original
+        assert daemon.executor._resend_thread is not None
+        assert not daemon.executor._resend_thread.is_alive()
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
+        daemon._release_instance_lock()
 
 
 def test_missing_original_msg_id_is_rejected_for_reply_and_persistence(tmp_path):

@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "2.1.5"
+VERSION = "2.1.6"
 DEFAULT_PORT = 7272
 MAX_MESSAGE_SIZE = 1_048_576  # 1 MB
 HMAC_MAX_AGE = 300.0  # 5 minutes
@@ -707,6 +707,7 @@ class RouteRefused(Exception):
 class ReplySendResult:
     delivered: bool
     started: bool
+    transient: bool = False
 
 
 def _signal_process_group(process, signum):
@@ -835,6 +836,9 @@ class AutoExecutor:
         self._stopping = False
         self._shutdown_deadline = None
         self._shutdown_killed = set()
+        self._resend_stop_event = threading.Event()
+        self._resend_lock = threading.Lock()
+        self._resend_thread = None
 
     def can_accept(self):
         with self.lock:
@@ -971,6 +975,37 @@ class AutoExecutor:
         with self.lock:
             return worker in self._shutdown_killed
 
+    def _mark_shutdown_killed_after_signal_exit(self, worker, process):
+        returncode = process.poll()
+        if returncode not in (-signal.SIGTERM, -signal.SIGKILL):
+            return False
+        with self.lock:
+            self._shutdown_killed.add(worker)
+        return True
+
+    def stop_resending_pending_replies(self):
+        with self._resend_lock:
+            self._resend_stop_event.set()
+
+    def start_resend_thread(self):
+        with self._resend_lock:
+            thread = threading.Thread(
+                target=self.resend_pending_replies,
+                name="relay-reply-resend",
+                daemon=True,
+            )
+            self._resend_thread = thread
+        thread.start()
+        return thread
+
+    def join_resend_thread(self, timeout=None):
+        with self._resend_lock:
+            thread = self._resend_thread
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
     def wait_for_workers(self, timeout):
         """Join active workers for at most timeout seconds and return their IDs."""
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
@@ -998,34 +1033,22 @@ class AutoExecutor:
                 for process in helpers
             )
 
-        def mark_shutdown_killed(worker, process, signal_sent):
-            if not signal_sent:
-                return
-            returncode = process.poll()
-            if returncode is not None and returncode not in (
-                -signal.SIGTERM,
-                -signal.SIGKILL,
-            ):
-                return
-            with self.lock:
-                self._shutdown_killed.add(worker)
+        def mark_shutdown_killed_after_signal_exit(worker, process, execution):
+            if execution:
+                self._mark_shutdown_killed_after_signal_exit(worker, process)
 
         terminating = []
         for worker, process, execution in processes:
             if process.poll() is not None:
                 continue
-            signal_sent = False
             try:
                 _signal_process_group(process, signal.SIGTERM)
-                signal_sent = True
             except OSError as exc:
                 self.logger.warning(f"Could not terminate AUTO-EXEC process group: {exc}")
-            if execution:
-                mark_shutdown_killed(worker, process, signal_sent)
-            terminating.append((worker, process))
+            terminating.append((worker, process, execution))
 
         deadline = time.monotonic() + max(0.0, grace_period)
-        for _worker, process in terminating:
+        for worker, process, execution in terminating:
             remaining = max(0.0, deadline - time.monotonic())
             try:
                 process.wait(timeout=remaining)
@@ -1033,26 +1056,26 @@ class AutoExecutor:
                 pass
             except OSError as exc:
                 self.logger.warning(f"Could not wait for AUTO-EXEC child: {exc}")
+            mark_shutdown_killed_after_signal_exit(worker, process, execution)
 
         killed = []
-        for worker, process in terminating:
-            if process.poll() is None:
+        for worker, process, execution in terminating:
+            if process.poll() is not None:
+                mark_shutdown_killed_after_signal_exit(worker, process, execution)
+                continue
+            try:
+                signal_sent = _signal_process_group(process, signal.SIGKILL)
+            except OSError as exc:
                 signal_sent = False
-                try:
-                    _signal_process_group(process, signal.SIGKILL)
-                    signal_sent = True
-                except OSError as exc:
-                    self.logger.warning(f"Could not kill AUTO-EXEC process group: {exc}")
-                if any(
-                    execution and item_worker is worker and item_process is process
-                    for item_worker, item_process, execution in processes
-                ):
-                    mark_shutdown_killed(worker, process, signal_sent)
-                killed.append((worker, process))
+                self.logger.warning(f"Could not kill AUTO-EXEC process group: {exc}")
+            if signal_sent and execution:
+                with self.lock:
+                    self._shutdown_killed.add(worker)
+            killed.append((worker, process, execution))
 
         reap_deadline = time.monotonic() + max(0.0, reap_timeout)
         unreaped = []
-        for worker, process in killed:
+        for worker, process, execution in killed:
             remaining = max(0.0, reap_deadline - time.monotonic())
             try:
                 process.wait(timeout=remaining)
@@ -1061,6 +1084,7 @@ class AutoExecutor:
             except OSError as exc:
                 self.logger.warning(f"Could not reap AUTO-EXEC child: {exc}")
                 unreaped.append((worker, process))
+            mark_shutdown_killed_after_signal_exit(worker, process, execution)
         if unreaped:
             self.logger.error(
                 "AUTO-EXEC child processes did not reap after SIGKILL: "
@@ -1106,9 +1130,10 @@ class AutoExecutor:
 
         def mark_shutdown_killed_if_stopping(process):
             with self.lock:
-                if (self._stopping and self.processes.get(worker) is process
-                        and process.poll() is None):
-                    self._shutdown_killed.add(worker)
+                tracked = self._stopping and self.processes.get(worker) is process
+            if not tracked:
+                return
+            self._mark_shutdown_killed_after_signal_exit(worker, process)
 
         try:
             if self._is_stopping():
@@ -1207,7 +1232,6 @@ class AutoExecutor:
                     stdout, stderr = proc.communicate(timeout=self.config.exec_timeout)
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    mark_shutdown_killed_if_stopping(proc)
                     try:
                         _signal_process_group(proc, signal.SIGTERM)
                     except OSError as signal_exc:
@@ -1215,11 +1239,18 @@ class AutoExecutor:
                     try:
                         stdout, stderr = proc.communicate(timeout=5)
                     except subprocess.TimeoutExpired:
-                        mark_shutdown_killed_if_stopping(proc)
+                        process_was_running = proc.poll() is None
                         try:
-                            _signal_process_group(proc, signal.SIGKILL)
+                            signal_sent = _signal_process_group(proc, signal.SIGKILL)
                         except OSError as signal_exc:
+                            signal_sent = False
                             self.logger.warning(f"Could not kill AUTO-EXEC process group: {signal_exc}")
+                        with self.lock:
+                            stopping_process = (
+                                self._stopping and self.processes.get(worker) is proc
+                            )
+                            if process_was_running and signal_sent and stopping_process:
+                                self._shutdown_killed.add(worker)
                         try:
                             stdout, stderr = proc.communicate(timeout=5)
                         except subprocess.TimeoutExpired as reap_exc:
@@ -1230,6 +1261,7 @@ class AutoExecutor:
                             stdout, stderr = reap_exc.output, reap_exc.stderr
                     result = f"TIMEOUT after {self.config.exec_timeout}s"
                 finally:
+                    mark_shutdown_killed_if_stopping(proc)
                     self._forget_worker_process(worker, proc)
                 if self._worker_was_shutdown_killed(worker):
                     completion_allowed = False
@@ -1362,13 +1394,26 @@ class AutoExecutor:
             return None
 
     def resend_pending_replies(self):
-        """Retry pending results, then dead-letter after three helper starts."""
+        """Retry pending results and dead-letter after three failed helper attempts."""
+        with self._resend_lock:
+            self._resend_thread = threading.current_thread()
+            if self._resend_stop_event.is_set():
+                return
         held_dir = self.config.state_dir / "held"
         if not held_dir.is_dir():
             return
         for pending_path in sorted(held_dir.glob("*.reply-pending.json")):
+            if self._resend_stop_event.is_set():
+                return
             try:
-                record = json.loads(pending_path.read_text(encoding="utf-8"))
+                raw_record = pending_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                self.logger.warning(
+                    f"Could not read pending AUTO-EXEC reply {pending_path.name}: {exc}"
+                )
+                continue
+            try:
+                record = json.loads(raw_record)
                 if not isinstance(record, dict):
                     raise ValueError("pending reply record must be an object")
                 msg_id = _validate_msg_id(record.get("msg_id"))
@@ -1390,23 +1435,34 @@ class AutoExecutor:
                 dead_path = pending_path.with_name(
                     pending_path.name.removesuffix(".reply-pending.json") + ".reply-dead.json"
                 )
-                try:
-                    os.replace(pending_path, dead_path)
-                    _fsync_directory(held_dir, logger=self.logger)
-                    self.logger.error(
-                        f"Dead-lettered invalid pending AUTO-EXEC reply {pending_path.name}: {exc}"
-                    )
-                except OSError as dead_exc:
-                    self.logger.error(
-                        f"Could not dead-letter pending AUTO-EXEC reply {pending_path.name}: {dead_exc}"
-                    )
+                with self._resend_lock:
+                    if self._resend_stop_event.is_set():
+                        return
+                    try:
+                        os.replace(pending_path, dead_path)
+                        _fsync_directory(held_dir, logger=self.logger)
+                        self.logger.error(
+                            f"Dead-lettered invalid pending AUTO-EXEC reply {pending_path.name}: {exc}"
+                        )
+                    except OSError as dead_exc:
+                        self.logger.error(
+                            f"Could not dead-letter pending AUTO-EXEC reply {pending_path.name}: {dead_exc}"
+                        )
                 continue
 
             dead_path = held_dir / f"{msg_id}.reply-dead.json"
             if attempts >= MAX_REPLY_ATTEMPTS:
-                os.replace(pending_path, dead_path)
-                _fsync_directory(held_dir, logger=self.logger)
-                self.logger.error(f"Pending AUTO-EXEC reply exhausted attempts for {msg_id}")
+                with self._resend_lock:
+                    if self._resend_stop_event.is_set():
+                        return
+                    try:
+                        os.replace(pending_path, dead_path)
+                        _fsync_directory(held_dir, logger=self.logger)
+                        self.logger.error(f"Pending AUTO-EXEC reply exhausted attempts for {msg_id}")
+                    except OSError as exc:
+                        self.logger.warning(
+                            f"Could not dead-letter exhausted pending AUTO-EXEC reply {msg_id}: {exc}"
+                        )
                 continue
             msg = {
                 "msg_id": msg_id,
@@ -1414,37 +1470,38 @@ class AutoExecutor:
                 "body": "",
             }
             try:
+                if self._resend_stop_event.is_set():
+                    return
                 reply_result = self._send_result_back(msg, result, success)
-                if reply_result.delivered:
-                    pending_path.unlink()
-                    _fsync_directory(held_dir, logger=self.logger)
-                    self.logger.info(f"Resent pending AUTO-EXEC reply {msg_id}")
-                elif reply_result.started:
-                    record["attempts"] = attempts + 1
-                    if record["attempts"] >= MAX_REPLY_ATTEMPTS:
-                        self._write_reply_record(held_dir, dead_path, msg_id, record)
+                if reply_result.transient:
+                    self.logger.warning(
+                        f"Transient failure while resending pending AUTO-EXEC reply {msg_id}"
+                    )
+                    continue
+                with self._resend_lock:
+                    if self._resend_stop_event.is_set():
+                        return
+                    if reply_result.delivered:
                         pending_path.unlink()
                         _fsync_directory(held_dir, logger=self.logger)
-                        self.logger.error(f"Pending AUTO-EXEC reply exhausted attempts for {msg_id}")
+                        self.logger.info(f"Resent pending AUTO-EXEC reply {msg_id}")
                     else:
-                        self._write_reply_record(held_dir, pending_path, msg_id, record)
-                elif not self._is_stopping():
-                    os.replace(pending_path, dead_path)
-                    _fsync_directory(held_dir, logger=self.logger)
-                    self.logger.error(
-                        f"Dead-lettered pending AUTO-EXEC reply {msg_id}: helper could not start"
-                    )
+                        record["attempts"] = attempts + 1
+                        if record["attempts"] >= MAX_REPLY_ATTEMPTS:
+                            self._write_reply_record(held_dir, dead_path, msg_id, record)
+                            pending_path.unlink()
+                            _fsync_directory(held_dir, logger=self.logger)
+                            self.logger.error(f"Pending AUTO-EXEC reply exhausted attempts for {msg_id}")
+                        else:
+                            self._write_reply_record(held_dir, pending_path, msg_id, record)
+            except (OSError, TimeoutError, subprocess.TimeoutExpired) as exc:
+                self.logger.warning(
+                    f"Transient failure while resending pending AUTO-EXEC reply {msg_id}: {exc}"
+                )
             except Exception as exc:
-                try:
-                    os.replace(pending_path, dead_path)
-                    _fsync_directory(held_dir, logger=self.logger)
-                    self.logger.error(
-                        f"Dead-lettered pending AUTO-EXEC reply {msg_id}: {exc}"
-                    )
-                except OSError as dead_exc:
-                    self.logger.error(
-                        f"Could not dead-letter pending AUTO-EXEC reply {msg_id}: {dead_exc}"
-                    )
+                self.logger.warning(
+                    f"Could not resend pending AUTO-EXEC reply {msg_id}: {exc}"
+                )
 
     def _log_to_vault(self, task, result, success, duration, model, budget):
         try:
@@ -1466,6 +1523,7 @@ class AutoExecutor:
     def _send_result_back(self, original_msg, result, success):
         process = None
         started = False
+        transient = False
         msg_id = original_msg.get("msg_id") if isinstance(original_msg, dict) else None
         try:
             _validate_msg_id(msg_id)
@@ -1490,6 +1548,7 @@ class AutoExecutor:
             try:
                 process.communicate(timeout=self._worker_process_timeout(30.0))
             except subprocess.TimeoutExpired:
+                transient = True
                 try:
                     _signal_process_group(process, signal.SIGTERM)
                 except OSError as signal_exc:
@@ -1510,12 +1569,13 @@ class AutoExecutor:
                             self.logger.error("Result-reply helper did not reap after SIGKILL")
             if process.poll() is not None:
                 self._forget_worker_process(worker, process)
-            return ReplySendResult(process.returncode == 0, started)
+            return ReplySendResult(process.returncode == 0 and not transient, started, transient)
         except Exception as e:
             self.logger.warning(f"Failed to relay result back for {msg_id}: {e}")
             if process is not None and process.poll() is not None:
                 self._forget_worker_process(threading.current_thread(), process)
-            return ReplySendResult(False, started)
+            transient = isinstance(e, (OSError, TimeoutError, subprocess.TimeoutExpired))
+            return ReplySendResult(False, started, transient)
 
 
 # ── Daemon ──
@@ -2361,6 +2421,7 @@ class RelayDaemon:
         tcp_server = None
         uds_server = None
         resend_task = None
+        resend_thread = None
         watcher_task = None
         drain_task = None
         sock_path = Path(self.config.socket_path)
@@ -2403,9 +2464,13 @@ class RelayDaemon:
             owns_socket = True
             os.chmod(self.config.socket_path, 0o600)
             self.logger.info(f"UDS server listening on {self.config.socket_path}")
-            resend_task = asyncio.create_task(
-                asyncio.to_thread(self.executor.resend_pending_replies)
-            )
+            resend_thread = self.executor.start_resend_thread()
+
+            async def wait_for_resend_thread():
+                while resend_thread.is_alive():
+                    await asyncio.sleep(0.01)
+
+            resend_task = asyncio.create_task(wait_for_resend_thread())
 
             watcher_task = asyncio.create_task(self.watch_file_inbox())
             drain_task = asyncio.create_task(self.drain_queued())
@@ -2414,6 +2479,7 @@ class RelayDaemon:
         finally:
             # Day's launchd ExitTimeOut is 20 seconds. Keep relay teardown inside 18.
             shutdown_deadline = time.monotonic() + 18.0
+            self.executor.stop_resending_pending_replies()
             try:
                 self.logger.info("Shutting down...")
                 with self._lifecycle_lock:
@@ -2430,10 +2496,7 @@ class RelayDaemon:
                         except asyncio.TimeoutError:
                             self.logger.error("Relay server did not close within shutdown budget")
 
-                tasks = [
-                    task for task in (watcher_task, drain_task, resend_task)
-                    if task is not None
-                ]
+                tasks = [task for task in (watcher_task, drain_task) if task is not None]
                 for task in tasks:
                     task.cancel()
                 if tasks:
@@ -2441,6 +2504,12 @@ class RelayDaemon:
                     _done, pending = await asyncio.wait(tasks, timeout=remaining)
                     if pending:
                         self.logger.error("Relay background tasks did not stop within shutdown budget")
+                if resend_task is not None:
+                    remaining = max(0.0, min(1.0, shutdown_deadline - time.monotonic()))
+                    try:
+                        await asyncio.wait_for(asyncio.shield(resend_task), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        self.logger.error("Pending AUTO-EXEC reply resend task did not stop promptly")
 
                 join_timeout = max(0.0, min(3.0, shutdown_deadline - time.monotonic()))
                 self.executor.wait_for_workers(join_timeout)
@@ -2457,6 +2526,20 @@ class RelayDaemon:
                     self.logger.error(
                         f"AUTO-EXEC workers still in flight at shutdown: {', '.join(in_flight)}"
                     )
+                remaining = max(0.0, shutdown_deadline - time.monotonic())
+                if not self.executor.join_resend_thread(remaining):
+                    self.logger.error(
+                        "Pending AUTO-EXEC reply resend thread did not stop within shutdown budget"
+                    )
+                if resend_task is not None and not resend_task.done():
+                    remaining = max(0.0, shutdown_deadline - time.monotonic())
+                    try:
+                        await asyncio.wait_for(asyncio.shield(resend_task), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        self.logger.error(
+                            "Pending AUTO-EXEC reply resend task did not stop within shutdown budget"
+                        )
+                        resend_task.cancel()
             finally:
                 try:
                     try:
